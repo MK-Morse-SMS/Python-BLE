@@ -1,0 +1,20 @@
+meta {
+  name: Start Scan
+  type: http
+  seq: 2
+}
+
+post {
+  url: http://localhost:8000/gap/start-scan
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "service_uuids": [
+      "04403980-1579-4b57-81eb-bfcdce019b9e",
+      "2772836b-8bb0-4d0f-a52c-254b5d1fa437"
+    ]
+  }
+}

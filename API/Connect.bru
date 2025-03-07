@@ -1,0 +1,19 @@
+meta {
+  name: Connect
+  type: http
+  seq: 3
+}
+
+post {
+  url: http://localhost:8000/gap/batch-connect
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "list": [
+      "CF:9D:46:8C:25:D4"
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "version": "1",
+  "name": "Python BLE",
+  "type": "collection",
+  "ignore": [
+    "node_modules",
+    ".git"
+  ]
+}
