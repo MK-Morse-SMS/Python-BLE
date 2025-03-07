@@ -27,6 +27,8 @@ class BLEManager:
         self.device_names: Dict[str, str] = {}
         # Lock for managing connection attempts
         self.connection_lock = asyncio.Lock()
+        # Keep a reference to the active scanner
+        self.active_scanner = None
     
     async def detection_callback(self, device: BLEDevice, advertisement_data: AdvertisementData):
         if device.name and (not self.scan_filters or any(uuid in advertisement_data.service_uuids for uuid in self.scan_filters)):
@@ -45,18 +47,47 @@ class BLEManager:
     async def scan_loop(self):
         while True:
             try:
-                scanner = BleakScanner(
+                # Create a new scanner instance
+                self.active_scanner = BleakScanner(
                     detection_callback=self.detection_callback,
                     service_uuids=self.scan_filters,
                     scanning_mode="active"
                 )
-                await scanner.start()
-                await asyncio.sleep(300)
-                await scanner.stop()
-                # Clear the devices map after each scan cycle.
+                
+                # Start scanning
+                await self.active_scanner.start()
+                
+                # Wait for scan period or until cancelled
+                try:
+                    await asyncio.sleep(300)  # 5 minute scan cycle
+                except asyncio.CancelledError:
+                    logger.info("Scan loop cancelled while scanning")
+                    raise  # Re-raise to exit the task
+                
+                # Stop the scanner
+                await self.active_scanner.stop()
+                self.active_scanner = None
+                
+                # Clear the devices map after each scan cycle
                 self.devices.clear()
+                
+            except asyncio.CancelledError:
+                logger.info("Scan loop cancelled")
+                # Make sure to stop the scanner if it's active
+                if self.active_scanner:
+                    await self.active_scanner.stop()
+                    self.active_scanner = None
+                raise  # Re-raise to exit the task
+                
             except Exception as e:
                 logger.error(f"Error in scan loop: {str(e)}", exc_info=True)
+                if self.active_scanner:
+                    try:
+                        await self.active_scanner.stop()
+                    except Exception:
+                        pass
+                    self.active_scanner = None
+                
             await asyncio.sleep(1)
 
     async def connection_loop(self, mac: str):
@@ -242,3 +273,29 @@ class BLEManager:
         disconnect_tasks = [self.disconnect_device(mac) for mac in list(self.connection_list)]
         if disconnect_tasks:
             await asyncio.gather(*disconnect_tasks)
+
+    async def stop_scan(self):
+        """Stop any active scanning."""
+        self.scan_filters = []
+        
+        # First stop the active scanner if it exists
+        if self.active_scanner:
+            try:
+                logger.info("Stopping active scanner")
+                await self.active_scanner.stop()
+                self.active_scanner = None
+            except Exception as e:
+                logger.error(f"Error stopping scanner: {str(e)}")
+        
+        # Then cancel the scan task
+        if self.scan_task and not self.scan_task.done():
+            logger.info("Cancelling scan task")
+            self.scan_task.cancel()
+            try:
+                # Wait for task cancellation to complete
+                await asyncio.wait_for(self.scan_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            self.scan_task = None
+            
+        return {"status": "scanning stopped"}

@@ -106,6 +106,14 @@ async def start_scan(
     result = await ble_manager.start_scan(service_uuids)
     return JSONResponse(content=result)
 
+# 9. Stop scanning.
+@router.delete("/gap/stop-scan")
+async def stop_scan(
+    ble_manager: BLEManager = Depends(get_ble_manager)
+):
+    await ble_manager.stop_scan()
+    return JSONResponse(content={"status": "scan stopped"})
+
 # 9. SSE endpoint to stream scan results, connection events, and notifications.
 @router.get("/events")
 async def sse_events(
