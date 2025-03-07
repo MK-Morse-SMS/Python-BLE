@@ -1,0 +1,16 @@
+meta {
+  name: Enable Notifications
+  type: http
+  seq: 7
+}
+
+post {
+  url: http://localhost:8000/gatt/nodes/{{node}}/characteristic/{{characteristic}}
+  body: none
+  auth: none
+}
+
+vars:pre-request {
+  node: CF:9D:46:8C:25:D4
+  characteristic: 2772836b-8bb0-4d0f-a52c-254b5d1fa438
+}

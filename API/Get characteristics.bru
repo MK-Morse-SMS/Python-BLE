@@ -1,0 +1,15 @@
+meta {
+  name: Get characteristics
+  type: http
+  seq: 6
+}
+
+get {
+  url: http://localhost:8000/gatt/nodes/{{node}}/characteristics
+  body: none
+  auth: none
+}
+
+vars:pre-request {
+  node: CF:9D:46:8C:25:D4
+}

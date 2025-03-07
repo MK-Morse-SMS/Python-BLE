@@ -5,9 +5,13 @@ meta {
 }
 
 get {
-  url: http://localhost:8000/gap/nodes
+  url: http://localhost:8000/gap/nodes?connection_state=connected
   body: none
   auth: none
+}
+
+params:query {
+  connection_state: connected
 }
 
 headers {

@@ -1,0 +1,23 @@
+meta {
+  name: Disconnect
+  type: http
+  seq: 9
+}
+
+delete {
+  url: http://localhost:8000/gatt/nodes/{{node}}
+  body: none
+  auth: none
+}
+
+body:json {
+  {
+    "mac_addresses": [
+      "CF:9D:46:8C:25:D4"
+    ]
+  }
+}
+
+vars:pre-request {
+  node: CF:9D:46:8C:25:D4
+}
