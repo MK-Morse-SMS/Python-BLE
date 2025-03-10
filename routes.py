@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Body, Path, Query, Depends
+from fastapi import APIRouter, Body, Path, Query, Depends, Request
 from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.responses import Response
 import json
 
 from models import BatchConnectRequest, StartScanRequest
@@ -15,10 +16,19 @@ def get_ble_manager():
     return ble_manager
 
 # --- SSE Event Generator ---
-async def event_generator(ble_manager: BLEManager):
-    while True:
-        event = await ble_manager.event_queue.get()
-        yield f"data: {json.dumps(event)}\n\n"
+async def event_generator(ble_manager: BLEManager, request: Request):
+    client_id = ble_manager.event_broadcaster.register_client()
+    try:
+        while True:
+            # Check if client disconnected
+            if await request.is_disconnected():
+                break
+                
+            event = await ble_manager.event_broadcaster.get_client_event(client_id)
+            yield f"data: {json.dumps(event)}\n\n"
+    finally:
+        # Always unregister the client when the connection ends
+        ble_manager.event_broadcaster.unregister_client(client_id)
 
 # --- API Endpoints ---
 
@@ -123,6 +133,10 @@ async def stop_scan(
 # 9. SSE endpoint to stream scan results, connection events, and notifications.
 @router.get("/events")
 async def sse_events(
+    request: Request,
     ble_manager: BLEManager = Depends(get_ble_manager)
 ):
-    return StreamingResponse(event_generator(ble_manager), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(ble_manager, request),
+        media_type="text/event-stream"
+    )

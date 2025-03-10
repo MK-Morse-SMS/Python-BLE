@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 import logging
 from bleak import BleakClient, BleakScanner, BLEDevice, AdvertisementData
 from fastapi import HTTPException
+from event_broadcaster import EventBroadcaster
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +20,8 @@ class BLEManager:
         self.scan_task: asyncio.Task = None
         # The current list of service UUID filters for scanning.
         self.scan_filters: List[str] = []
-        # An event queue for SSE events.
-        self.event_queue: asyncio.Queue = asyncio.Queue()
+        # Replace the queue with a broadcaster
+        self.event_broadcaster = EventBroadcaster()
         # Mac address -> BLEDevice mapping.
         self.devices: Dict[str, BLEDevice] = {}
         # Mac address -> device name mapping.
@@ -42,7 +43,7 @@ class BLEManager:
                 "type": "scan",
                 "results": [{"bdaddr": device.address, "name": device.name, "rssi": advertisement_data.rssi}]
             }
-            await self.event_queue.put(event)
+            await self.event_broadcaster.broadcast(event)
 
     async def scan_loop(self):
         while True:
@@ -149,7 +150,7 @@ class BLEManager:
                         logger.info(f"Successfully connected to {mac}")
                         
                         # Report connection event via SSE.
-                        await self.event_queue.put({
+                        await self.event_broadcaster.broadcast({
                             "type": "connection",
                             "bdaddr": mac,
                             "status": "connected"
@@ -177,7 +178,7 @@ class BLEManager:
     # Helper method to handle disconnection (called by the callback)
     async def _handle_disconnection(self, mac: str):
         """Send disconnection event to the event queue."""
-        await self.event_queue.put({
+        await self.event_broadcaster.broadcast({
             "type": "connection",
             "bdaddr": mac,
             "status": "disconnected"
@@ -203,7 +204,7 @@ class BLEManager:
                 await client.disconnect()
             except Exception:
                 pass
-            await self.event_queue.put({
+            await self.event_broadcaster.broadcast({
                 "type": "connection",
                 "bdaddr": mac,
                 "status": "disconnected"
@@ -241,7 +242,7 @@ class BLEManager:
 
         # Notification callback: push event to SSE queue.
         def notification_handler(sender, data):
-            asyncio.create_task(self.event_queue.put({
+            asyncio.create_task(self.event_broadcaster.broadcast({
                 "type": "notification",
                 "bdaddr": mac,
                 "characteristic": char_uuid,
