@@ -84,7 +84,7 @@ async def disable_all_notifications(
     return JSONResponse(content={"status": "all notifications disabled"})
 
 # 7. Disconnect from a device.
-@router.delete("/gatt/nodes/{mac}")
+@router.delete("/gap/nodes/{mac}")
 async def disconnect_device(
     mac: str = Path(...),
     ble_manager: BLEManager = Depends(get_ble_manager)
