@@ -25,20 +25,16 @@ async def event_generator(ble_manager: BLEManager):
 # 1. List connected devices (filter by connection_state query parameter)
 @router.get("/gap/nodes")
 async def list_nodes(
-    connection_state: str = Query(None), 
     ble_manager: BLEManager = Depends(get_ble_manager)
 ):
-    if connection_state and connection_state.lower() == "connected":
-        nodes = []
-        for mac, client in ble_manager.connected_devices.items():
-            nodes.append({
-                "bdaddr": mac,
-                "name": ble_manager.device_names.get(mac, ""),
-                "connectionState": "connected"
-            })
-        return {"nodes": nodes}
-    else:
-        return {"nodes": []}
+    nodes = []
+    for mac, client in ble_manager.connected_devices.items():
+        nodes.append({
+            "bdaddr": mac,
+            "name": ble_manager.device_names.get(mac, ""),
+            "connectionState": "connected"
+        })
+    return {"nodes": nodes}
 
 # 2. Add devices to connection list and start automatic connection management.
 @router.post("/gap/batch-connect")
