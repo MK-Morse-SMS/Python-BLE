@@ -223,6 +223,16 @@ class BLEManager:
                     "description": getattr(char, "description", "")
                 })
         return characteristics
+    
+    async def read_characteristic(self, mac: str, char_uuid: str) -> str:
+        if mac not in self.connected_devices:
+            raise HTTPException(status_code=404, detail="Device not connected")
+        client = self.connected_devices[mac]
+        try:
+            value = await client.read_gatt_char(char_uuid)
+            return value.hex()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     async def enable_notification(self, mac: str, char_uuid: str):
         if mac not in self.connected_devices:

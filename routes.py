@@ -55,6 +55,16 @@ async def get_characteristics(
     characteristics = await ble_manager.list_characteristics(mac)
     return {"characteristics": characteristics}
 
+# Read a characteristic value.
+@router.get("/gatt/nodes/{mac}/characteristic/{char_uuid}")
+async def read_characteristic(
+    mac: str = Path(...),
+    char_uuid: str = Path(...),
+    ble_manager: BLEManager = Depends(get_ble_manager)
+):
+    value = await ble_manager.read_characteristic(mac, char_uuid)
+    return JSONResponse(content={"value": value})
+
 # 4. Enable notifications on a characteristic.
 @router.post("/gatt/nodes/{mac}/characteristic/{char_uuid}")
 async def enable_char_notification(
