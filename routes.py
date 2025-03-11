@@ -1,6 +1,5 @@
-from fastapi import APIRouter, Body, Path, Query, Depends, Request
+from fastapi import APIRouter, Body, Path, Depends, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-from starlette.responses import Response
 import json
 
 from models import BatchConnectRequest, StartScanRequest
@@ -38,10 +37,11 @@ async def list_nodes(
     ble_manager: BLEManager = Depends(get_ble_manager)
 ):
     nodes = []
-    for mac, client in ble_manager.connected_devices.items():
+    connected_devices = await ble_manager.get_connected_devices()
+    for mac, client in connected_devices.items():
         nodes.append({
             "bdaddr": mac,
-            "name": ble_manager.device_names.get(mac, ""),
+            "name": client,
             "connectionState": "connected"
         })
     return {"nodes": nodes}
@@ -53,7 +53,7 @@ async def batch_connect(
     ble_manager: BLEManager = Depends(get_ble_manager)
 ):
     for mac in request.mac_addresses:
-        ble_manager.add_device(mac)
+        await ble_manager.add_device(mac)
     return JSONResponse(content={"status": "devices added to connection list", "devices": request.mac_addresses})
 
 # 3. List Characteristics on a connected device.

@@ -1,354 +1,135 @@
-import asyncio
-import contextlib
-from typing import List, Dict, Any
 import logging
-from bleak import BleakClient, BleakScanner, BLEDevice, AdvertisementData
-from fastapi import HTTPException
-from event_broadcaster import EventBroadcaster
-from dbus_fast.aio import MessageBus
-from dbus_fast.constants import BusType
+from typing import List, Dict, Any
 
-# D-Bus service and interface constants
-BLUEZ_SERVICE = 'org.bluez'
-OBJECT_MANAGER_INTERFACE = 'org.freedesktop.DBus.ObjectManager'
-DEVICE_INTERFACE = 'org.bluez.Device1'
+from event_broadcaster import EventBroadcaster
+
+from dbus_utils import disconnect_all_devices
+from ble_scanner import BLEScanner
+from ble_connections import BLEConnectionsManager
 
 logger = logging.getLogger(__name__)
 
-class BLEManager:
-    def __init__(self):
-        # The set of MAC addresses that we want to be connected to.
-        self.connection_list = set()  # type: set[str]
-        # Currently connected devices: MAC address -> BleakClient
-        self.connected_devices: Dict[str, BleakClient] = {}
-        # Tasks managing device connection loops.
-        self.connection_tasks: Dict[str, asyncio.Task] = {}
-        # Background scanning task.
-        self.scan_task: asyncio.Task = None
-        # The current list of service UUID filters for scanning.
-        self.scan_filters: List[str] = []
-        # Replace the queue with a broadcaster
-        self.event_broadcaster = EventBroadcaster()
-        # Mac address -> BLEDevice mapping.
-        self.devices: Dict[str, BLEDevice] = {}
-        # Mac address -> device name mapping.
-        self.device_names: Dict[str, str] = {}
-        # Lock for managing connection attempts
-        self.connection_lock = asyncio.Lock()
-        # Keep a reference to the active scanner
-        self.active_scanner = None
 
-    async def initialize(self):
-        """Async initialization method that should be called after creating the instance."""
+class BLEManager:
+    """
+    A high-level manager that composes scanning, connection management, and
+    the D-Bus disconnect utility into a single API.
+    """
+
+    def __init__(self):
+        """
+        Initialize the BLEManager. For best usage, call `await initialize()`
+        to perform an initial disconnect_all_devices at the system level.
+        """
+        # An event broadcaster (e.g., for SSE) used by both scanner & connections
+        self.event_broadcaster = EventBroadcaster()
+
+        # Create sub-managers
+        self.scanner = BLEScanner(event_broadcaster=self.event_broadcaster)
+        self.connections = BLEConnectionsManager(event_broadcaster=self.event_broadcaster)
+
+    async def initialize(self) -> None:
+        """
+        Perform any async initialization. For example, forcibly disconnect
+        all devices at the D-Bus level to ensure a clean environment.
+        """
         await disconnect_all_devices()
 
-    
-    async def detection_callback(self, device: BLEDevice, advertisement_data: AdvertisementData):
-        if device.name and (not self.scan_filters or any(uuid in advertisement_data.service_uuids for uuid in self.scan_filters)):
-            # Only add the device to the list if it's not already there
-            if device.address not in self.devices:
-                self.devices[device.address] = device
-                self.device_names[device.address] = device.name
-            
-            # Push the scan event to the event queue.
-            event = {
-                "type": "scan",
-                "results": [{"bdaddr": device.address, "name": device.name, "rssi": advertisement_data.rssi}]
-            }
-            await self.event_broadcaster.broadcast(event)
+    async def start_scan(self, service_uuids: List[str]) -> Dict[str, str]:
+        """
+        Public method to initiate BLE scanning with optional service UUID filters.
 
-    async def scan_loop(self):
-        while True:
-            try:
-                # Create a new scanner instance
-                self.active_scanner = BleakScanner(
-                    detection_callback=self.detection_callback,
-                    service_uuids=self.scan_filters,
-                    scanning_mode="active"
-                )
-                
-                # Start scanning
-                await self.active_scanner.start()
-                
-                # Wait for scan period or until cancelled
-                try:
-                    await asyncio.sleep(300)  # 5 minute scan cycle
-                except asyncio.CancelledError:
-                    logger.info("Scan loop cancelled while scanning")
-                    raise  # Re-raise to exit the task
-                
-                # Stop the scanner
-                await self.active_scanner.stop()
-                self.active_scanner = None
-                
-                # Clear the devices map after each scan cycle
-                self.devices.clear()
-                
-            except asyncio.CancelledError:
-                logger.info("Scan loop cancelled")
-                # Make sure to stop the scanner if it's active
-                if self.active_scanner:
-                    await self.active_scanner.stop()
-                    self.active_scanner = None
-                raise  # Re-raise to exit the task
-                
-            except Exception as e:
-                logger.error(f"Error in scan loop: {str(e)}", exc_info=True)
-                if self.active_scanner:
-                    try:
-                        await self.active_scanner.stop()
-                    except Exception:
-                        pass
-                    self.active_scanner = None
-                
-            await asyncio.sleep(1)
+        :param service_uuids: A list of service UUIDs to filter by, or empty for none.
+        :return: Status about the scan.
+        """
+        return await self.scanner.start_scan(service_uuids)
 
-    async def connection_loop(self, mac: str):
-        """Continuously try to connect/reconnect to a device."""
-        # check if the device is still in the connection list
-        if mac not in self.connection_list:
+    async def stop_scan(self) -> Dict[str, str]:
+        """
+        Public method to stop BLE scanning.
+
+        :return: Status about stopping the scan.
+        """
+        return await self.scanner.stop_scan()
+
+    async def add_device(self, mac: str) -> None:
+        """
+        Add a device to the desired connections, triggering a background connection loop.
+
+        :param mac: The MAC address of the BLE device to connect to.
+        """
+        # Retrieve device from scanner cache if present
+        device = await self.scanner.get_device(mac)
+        if not device:
+            logger.error(f"Device {mac} not found for connection.")
             return
-        
-        # check if the device is already connected
-        if mac in self.connected_devices:
-            return
-        
-        logger.info(f"Starting connection loop for device: {mac}")
-        
-        # Disconnection event to signal when the callback has processed the disconnection
-        disconnect_event = asyncio.Event()
-        
-        # Disconnection callback function
-        def disconnection_handler(client):
-            logger.warning(f"Connection to {mac} dropped")
-            # Mark the device as disconnected in our data structures
-            self.connected_devices.pop(mac, None)
-            # Create a task to send the disconnection event via SSE
-            # (can't use await directly in a callback)
-            asyncio.create_task(self._handle_disconnection(mac))
-            # Signal the connection loop that disconnection has been processed
-            disconnect_event.set()
-        
-        while mac in self.connection_list:
-            try:
-                # Reset the disconnection event
-                disconnect_event.clear()
-                
-                # Use an AsyncExitStack for proper resource management
-                async with contextlib.AsyncExitStack() as stack:
-                    # Acquire lock before scanning and connecting
-                    async with self.connection_lock:
-                        logger.debug(f"Attempting to connect to {mac}")
-                        
-                        # If the device is in the devices map, use it directly.
-                        device = self.devices.get(mac)
-                        if device is None:
-                            # If the device is not found in the devices map, scan for it.
-                            logger.debug(f"Scanning for device {mac}")
-                            device = await BleakScanner.find_device_by_address(mac)
-                            if device is None:
-                                logger.warning(f"Device {mac} not found during scan")
-                                await asyncio.sleep(5)  # Back-off before retrying
-                                continue
-                        
-                        # Create the client with the disconnection callback
-                        client = BleakClient(device, disconnected_callback=disconnection_handler)
-                        await client.connect()
-                        self.connected_devices[mac] = client
-                        
-                        # Register cleanup callback
-                        stack.callback(logger.debug, f"Releasing connection to {mac}")
-                        
-                        logger.info(f"Successfully connected to {mac}")
-                        
-                        # Report connection event via SSE.
-                        await self.event_broadcaster.broadcast({
-                            "type": "connection",
-                            "bdaddr": mac,
-                            "status": "connected"
-                        })
-                    
-                    # Lock is released here but client remains connected
-                    
-                    # Wait for the disconnection event instead of polling
-                    await disconnect_event.wait()
-                    
-                    # Connection has been dropped and handled by the callback
-                    # We just exit the context manager now to clean up
 
-            except Exception as e:
-                logger.error(f"Error connecting to {mac}: {str(e)}")
-                # If the device was added to connected_devices before the exception,
-                # make sure we remove it
-                self.connected_devices.pop(mac, None)
-                await asyncio.sleep(5)  # Back-off before retrying
+        # Hand off to the connections manager
+        self.connections.add_device(device)
 
-            # A brief pause before attempting reconnection
-            logger.debug(f"Waiting before reconnection attempt to {mac}")
-            await asyncio.sleep(1)
+    async def disconnect_device(self, mac: str) -> None:
+        """
+        Disconnect from a single device by MAC.
 
-    # Helper method to handle disconnection (called by the callback)
-    async def _handle_disconnection(self, mac: str):
-        """Send disconnection event to the event queue."""
-        await self.event_broadcaster.broadcast({
-            "type": "connection",
-            "bdaddr": mac,
-            "status": "disconnected"
-        })
+        :param mac: The target device's MAC address.
+        """
+        await self.connections.disconnect_device(mac)
 
-    def add_device(self, mac: str):
-        if mac not in self.connection_list:
-            self.connection_list.add(mac)
-            # Start a background task to maintain connection.
-            self.connection_tasks[mac] = asyncio.create_task(self.connection_loop(mac))
-
-    async def disconnect_device(self, mac: str):
-        if mac in self.connection_list:
-            self.connection_list.remove(mac)
-        # Cancel the connection task if it exists.
-        if mac in self.connection_tasks:
-            task = self.connection_tasks.pop(mac)
-            task.cancel()
-        # If the device is connected, disconnect it.
-        if mac in self.connected_devices:
-            client = self.connected_devices.pop(mac)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            await self.event_broadcaster.broadcast({
-                "type": "connection",
-                "bdaddr": mac,
-                "status": "disconnected"
-            })
+    async def disconnect_all(self) -> None:
+        """
+        Disconnect all known devices from the connection manager.
+        """
+        await self.connections.disconnect_all()
 
     async def list_characteristics(self, mac: str) -> List[Dict[str, Any]]:
-        if mac not in self.connected_devices:
-            raise HTTPException(status_code=404, detail="Device not connected")
-        client = self.connected_devices[mac]
-        services = client.services
-        characteristics = []
-        for service in services:
-            for char in service.characteristics:
-                characteristics.append({
-                    "uuid": char.uuid,
-                    "properties": char.properties,
-                    "description": getattr(char, "description", "")
-                })
-        return characteristics
-    
+        """
+        List all characteristics for a connected device.
+
+        :param mac: Device MAC address.
+        :return: A list of characteristic dict objects (UUID, properties, etc.).
+        :raises HTTPException: If device is not connected
+        """
+        return await self.connections.list_characteristics(mac)
+
     async def read_characteristic(self, mac: str, char_uuid: str) -> str:
-        if mac not in self.connected_devices:
-            raise HTTPException(status_code=404, detail="Device not connected")
-        client = self.connected_devices[mac]
-        try:
-            value = await client.read_gatt_char(char_uuid)
-            return value.hex()
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        """
+        Read a characteristic from a connected device, returning its value in hex.
 
-    async def enable_notification(self, mac: str, char_uuid: str):
-        if mac not in self.connected_devices:
-            raise HTTPException(status_code=404, detail="Device not connected")
-        client = self.connected_devices[mac]
+        :param mac: Device MAC address.
+        :param char_uuid: Characteristic UUID to read from.
+        :return: Hex string of the read value.
+        :raises HTTPException: If device not connected or read fails.
+        """
+        return await self.connections.read_characteristic(mac, char_uuid)
 
-        # Notification callback: push event to SSE queue.
-        def notification_handler(sender, data):
-            asyncio.create_task(self.event_broadcaster.broadcast({
-                "type": "notification",
-                "bdaddr": mac,
-                "characteristic": char_uuid,
-                "data": data.hex()
-            }))
+    async def enable_notification(self, mac: str, char_uuid: str) -> None:
+        """
+        Enable notifications for a particular characteristic on a connected device.
 
-        try:
-            await client.start_notify(char_uuid, notification_handler)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        :param mac: Device MAC address.
+        :param char_uuid: Characteristic UUID to enable notifications for.
+        """
+        await self.connections.enable_notification(mac, char_uuid)
 
-    async def disable_notification(self, mac: str, char_uuid: str):
-        if mac not in self.connected_devices:
-            raise HTTPException(status_code=404, detail="Device not connected")
-        client = self.connected_devices[mac]
-        try:
-            await client.stop_notify(char_uuid)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+    async def disable_notification(self, mac: str, char_uuid: str) -> None:
+        """
+        Disable notifications for a particular characteristic on a connected device.
 
-    async def disable_all_notifications(self):
-        for mac, client in self.connected_devices.items():
-            services = client.services
-            for service in services:
-                for char in service.characteristics:
-                    try:
-                        await client.stop_notify(char.uuid)
-                    except Exception:
-                        pass
+        :param mac: Device MAC address.
+        :param char_uuid: Characteristic UUID to disable notifications for.
+        """
+        await self.connections.disable_notification(mac, char_uuid)
 
-    async def start_scan(self, service_uuids: List[str]):
-        self.scan_filters = service_uuids
-        # Start the scan loop if not already running.
-        if self.scan_task is None or self.scan_task.done():
-            self.scan_task = asyncio.create_task(self.scan_loop())
-        return {"status": "scanning started", "filters": self.scan_filters}
+    async def disable_all_notifications(self) -> None:
+        """
+        Disable notifications for all characteristics on all connected devices.
+        """
+        await self.connections.disable_all_notifications()
 
-    async def disconnect_all(self):
-        disconnect_tasks = [self.disconnect_device(mac) for mac in list(self.connection_list)]
-        if disconnect_tasks:
-            await asyncio.gather(*disconnect_tasks)
+    async def get_connected_devices(self) -> Dict[str, str]:
+        """
+        Return a dictionary of connected devices (MAC: name).
 
-    async def stop_scan(self):
-        """Stop any active scanning."""
-        self.scan_filters = []
-        
-        # First stop the active scanner if it exists
-        if self.active_scanner:
-            try:
-                logger.info("Stopping active scanner")
-                await self.active_scanner.stop()
-                self.active_scanner = None
-            except Exception as e:
-                logger.error(f"Error stopping scanner: {str(e)}")
-        
-        # Then cancel the scan task
-        if self.scan_task and not self.scan_task.done():
-            logger.info("Cancelling scan task")
-            self.scan_task.cancel()
-            try:
-                # Wait for task cancellation to complete
-                await asyncio.wait_for(self.scan_task, timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
-            self.scan_task = None
-            
-        return {"status": "scanning stopped"}
-    
-async def disconnect_all_devices():
-        # Connect to the system bus (BlueZ runs on the system bus)
-        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-        
-        # Get a proxy for the root object to access the ObjectManager interface
-        introspection = await bus.introspect(BLUEZ_SERVICE, "/")
-        obj = bus.get_proxy_object(BLUEZ_SERVICE, "/", introspection)
-        manager = obj.get_interface(OBJECT_MANAGER_INTERFACE)
-        
-        # Get all managed objects (devices, adapters, etc.)
-        managed_objects = await manager.call_get_managed_objects()
-        
-        for path, interfaces in managed_objects.items():
-            # Check if this object implements the Device1 interface
-            if DEVICE_INTERFACE in interfaces:
-                properties = interfaces[DEVICE_INTERFACE]
-                # Check if the device is currently connected
-                if "Connected" in properties and properties["Connected"].value:
-                    print(f"Disconnecting device at {path}")
-                    # Get a proxy for the device to call its methods
-                    device_introspection = await bus.introspect(BLUEZ_SERVICE, path)
-                    device_obj = bus.get_proxy_object(BLUEZ_SERVICE, path, device_introspection)
-                    device = device_obj.get_interface(DEVICE_INTERFACE)
-                    try:
-                        # Call the Disconnect method
-                        await device.call_disconnect()
-                        print(f"Disconnected device at {path}")
-                    except Exception as e:
-                        print(f"Failed to disconnect device {path}: {e}")
+        :return: A dictionary of connected devices.
+        """
+        return await self.connections.get_connected_devices()
