@@ -5,6 +5,13 @@ import logging
 from bleak import BleakClient, BleakScanner, BLEDevice, AdvertisementData
 from fastapi import HTTPException
 from event_broadcaster import EventBroadcaster
+from dbus_fast.aio import MessageBus
+from dbus_fast.constants import BusType
+
+# D-Bus service and interface constants
+BLUEZ_SERVICE = 'org.bluez'
+OBJECT_MANAGER_INTERFACE = 'org.freedesktop.DBus.ObjectManager'
+DEVICE_INTERFACE = 'org.bluez.Device1'
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +37,11 @@ class BLEManager:
         self.connection_lock = asyncio.Lock()
         # Keep a reference to the active scanner
         self.active_scanner = None
+
+    async def initialize(self):
+        """Async initialization method that should be called after creating the instance."""
+        await disconnect_all_devices()
+
     
     async def detection_callback(self, device: BLEDevice, advertisement_data: AdvertisementData):
         if device.name and (not self.scan_filters or any(uuid in advertisement_data.service_uuids for uuid in self.scan_filters)):
@@ -214,7 +226,7 @@ class BLEManager:
         if mac not in self.connected_devices:
             raise HTTPException(status_code=404, detail="Device not connected")
         client = self.connected_devices[mac]
-        services = await client.get_services()
+        services = client.services
         characteristics = []
         for service in services:
             for char in service.characteristics:
@@ -265,7 +277,7 @@ class BLEManager:
 
     async def disable_all_notifications(self):
         for mac, client in self.connected_devices.items():
-            services = await client.get_services()
+            services = client.services
             for service in services:
                 for char in service.characteristics:
                     try:
@@ -310,3 +322,33 @@ class BLEManager:
             self.scan_task = None
             
         return {"status": "scanning stopped"}
+    
+async def disconnect_all_devices():
+        # Connect to the system bus (BlueZ runs on the system bus)
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        
+        # Get a proxy for the root object to access the ObjectManager interface
+        introspection = await bus.introspect(BLUEZ_SERVICE, "/")
+        obj = bus.get_proxy_object(BLUEZ_SERVICE, "/", introspection)
+        manager = obj.get_interface(OBJECT_MANAGER_INTERFACE)
+        
+        # Get all managed objects (devices, adapters, etc.)
+        managed_objects = await manager.call_get_managed_objects()
+        
+        for path, interfaces in managed_objects.items():
+            # Check if this object implements the Device1 interface
+            if DEVICE_INTERFACE in interfaces:
+                properties = interfaces[DEVICE_INTERFACE]
+                # Check if the device is currently connected
+                if "Connected" in properties and properties["Connected"].value:
+                    print(f"Disconnecting device at {path}")
+                    # Get a proxy for the device to call its methods
+                    device_introspection = await bus.introspect(BLUEZ_SERVICE, path)
+                    device_obj = bus.get_proxy_object(BLUEZ_SERVICE, path, device_introspection)
+                    device = device_obj.get_interface(DEVICE_INTERFACE)
+                    try:
+                        # Call the Disconnect method
+                        await device.call_disconnect()
+                        print(f"Disconnected device at {path}")
+                    except Exception as e:
+                        print(f"Failed to disconnect device {path}: {e}")

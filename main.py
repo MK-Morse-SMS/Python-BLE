@@ -11,6 +11,8 @@ ble_manager = BLEManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize BLE manager during startup
+    await ble_manager.initialize()
     yield
     await ble_manager.disconnect_all()
 
