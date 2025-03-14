@@ -4,10 +4,14 @@ meta {
   seq: 11
 }
 
-post {
-  url: http://localhost:8000/gatt/nodes/{{node}}/characteristic/{{characteristic}}
+get {
+  url: http://localhost:8000/gatt/nodes/{{node}}/characteristics
   body: none
   auth: none
+}
+
+params:query {
+  ~mac: CF:9D:46:8C:25:D4
 }
 
 vars:pre-request {
