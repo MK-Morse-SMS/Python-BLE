@@ -186,7 +186,10 @@ class BLEScanner:
         # If the device is not found, try to specifically find it
         if not device:
             await self.pause_scan()
-            device = await BleakScanner.find_device_by_address(mac)
+            try:
+                device = await BleakScanner.find_device_by_address(mac)
+            except Exception as e:
+                logger.error(f"Error finding device {mac}: {str(e)}")
             if device:
                 self.devices[mac] = device
             await self.resume_scan()
