@@ -35,6 +35,9 @@ class BLEConnectionsManager:
         # Lock to prevent race conditions when scanning and connecting
         self.connection_lock = asyncio.Lock()
 
+        # Store device names separately from the BleakClient objects
+        self.device_names: Dict[str, str] = {}
+
     def add_device(self, device: BLEDevice) -> None:
         """
         Add a device to desired connections and start a connection task.
@@ -191,6 +194,30 @@ class BLEConnectionsManager:
                     logger.debug(f"Connecting to {mac}...")
                     await client.connect()
                     self.connected_devices[mac] = client
+
+                    # Try to read the device name characteristic (0x2A00)
+                    try:
+                        # First save the advertised name as fallback
+                        if device.name:
+                            self.device_names[mac] = device.name
+                        
+                        # Now try to read the actual characteristic
+                        # 0x2A00 is the Device Name characteristic in Generic Access service
+                        device_name_bytes = await client.read_gatt_char("00002a00-0000-1000-8000-00805f9b34fb")
+                        if device_name_bytes:
+                            try:
+                                # Convert bytes to string and store it
+                                device_name = device_name_bytes.decode('utf-8')
+                                self.device_names[mac] = device_name
+                                logger.info(f"Read device name for {mac}: {device_name}")
+                            except UnicodeDecodeError:
+                                logger.warning(f"Could not decode device name for {mac}")
+                    except Exception as e:
+                        logger.debug(f"Could not read device name characteristic for {mac}: {e}")
+                        # Use advertised name or address as fallback if we couldn't read the name
+                        if mac not in self.device_names:
+                            self.device_names[mac] = device.name or mac
+                    
                     logger.info(f"Successfully connected to {mac}.")
                     await self._broadcast_connection(mac, "connected")
 
@@ -241,4 +268,4 @@ class BLEConnectionsManager:
         """
         Return a dictionary of connected devices (MAC: name).
         """
-        return {mac: client._device.name for mac, client in self.connected_devices.items()}
+        return {mac: name for mac, name in self.device_names.items()}
