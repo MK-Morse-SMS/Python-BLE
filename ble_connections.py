@@ -128,6 +128,12 @@ class BLEConnectionsManager:
         :raises HTTPException: If device not connected
         """
         client = self._get_connected_client(mac)
+        
+        # Try disabling notifications first to avoid potential issues
+        try:
+            await client.stop_notify(char_uuid)
+        except Exception:
+            pass
 
         def notification_handler(sender, data):
             asyncio.create_task(self.event_broadcaster.broadcast({
