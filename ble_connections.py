@@ -117,6 +117,7 @@ class BLEConnectionsManager:
                     "properties": char.properties,
                     "description": getattr(char, "description", "")
                 })
+        logger.info(f"Characteristics for {mac}: {characteristics}")
         return characteristics
 
     async def enable_notification(self, mac: str, char_uuid: str) -> None:
@@ -147,6 +148,7 @@ class BLEConnectionsManager:
             await client.start_notify(char_uuid, notification_handler)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        logger.info(f"Enabled notifications for {mac} on {char_uuid}")
 
     async def disable_notification(self, mac: str, char_uuid: str) -> None:
         """

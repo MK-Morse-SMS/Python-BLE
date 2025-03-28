@@ -1,8 +1,15 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from ble_manager import BLEManager
 from routes import router
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+# os.environ["BLEAK_LOGGING"] = "1"
+# Set the logging level for bleak to DEBUG for detailed output
+logging.getLogger("bleak").setLevel(logging.DEBUG)
 
 # --- BLE Manager Implementation --
 
