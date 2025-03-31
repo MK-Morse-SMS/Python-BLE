@@ -75,6 +75,49 @@ async def read_characteristic(
     value = await ble_manager.read_characteristic(mac, char_uuid)
     return JSONResponse(content={"value": value})
 
+# Write a characteristic value.
+@router.get("/gatt/nodes/{mac}/characteristic/{char_uuid}/value/{value}")
+async def write_characteristic(
+    mac: str = Path(...),
+    char_uuid: str = Path(...),
+    value: str = Path(...),  # Expecting a hex string
+    noresponse: bool = False,  # Optional parameter to indicate no response needed
+    ble_manager: BLEManager = Depends(get_ble_manager)
+):
+    """
+    Write a value to a characteristic on a connected device.
+
+    :param mac: Device MAC address.
+    :param char_uuid: Characteristic UUID to write to.
+    :param value: Hex string value to write to the characteristic.
+    :param noresponse: If True, do not wait for a response from the device (default is False).
+    :return: JSON response indicating success or failure.
+    """
+    # Convert hex string to bytes
+    try:
+        byte_value = bytes.fromhex(value)
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "Invalid hex string"})
+
+    await ble_manager.write_characteristic(mac, char_uuid, byte_value, resp=not noresponse)
+    return JSONResponse(content={"status": "write successful", "bdaddr": mac, "characteristic": char_uuid})
+
+
+# Get MTU (Maximum Transmission Unit) for a connected device.
+@router.get("/gatt/nodes/{mac}/mtu")
+async def get_mtu(
+    mac: str = Path(...),
+    ble_manager: BLEManager = Depends(get_ble_manager)
+):
+    """
+    Get the Maximum Transmission Unit (MTU) size for a connected device.
+
+    :param mac: Device MAC address.
+    :return: JSON response with the MTU size.
+    """
+    mtu_size = await ble_manager.get_mtu(mac)
+    return JSONResponse(content={"mtu": mtu_size, "bdaddr": mac})
+
 # 4. Enable notifications on a characteristic.
 @router.post("/gatt/nodes/{mac}/characteristic/{char_uuid}")
 async def enable_char_notification(
@@ -140,3 +183,5 @@ async def sse_events(
         event_generator(ble_manager, request),
         media_type="text/event-stream"
     )
+
+# write charac

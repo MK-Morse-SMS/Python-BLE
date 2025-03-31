@@ -9,7 +9,7 @@ from routes import router
 logging.basicConfig(level=logging.INFO)
 # os.environ["BLEAK_LOGGING"] = "1"
 # Set the logging level for bleak to DEBUG for detailed output
-logging.getLogger("bleak").setLevel(logging.DEBUG)
+# logging.getLogger("bleak").setLevel(logging.DEBUG)
 
 # --- BLE Manager Implementation --
 

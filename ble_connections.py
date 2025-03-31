@@ -100,6 +100,45 @@ class BLEConnectionsManager:
             return value.hex()
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        
+    async def write_characteristic(self, mac: str, char_uuid: str, value: bytes, response: bool = False) -> None:
+        """
+        Write a value to a characteristic on a connected device.
+
+        :param mac: MAC of the device
+        :param char_uuid: Characteristic UUID
+        :param value: The bytes to write to the characteristic
+        :param response: If True, wait for a response from the device (if supported)
+        :raises HTTPException: If device not connected or write fails
+        """
+        client = self._get_connected_client(mac)
+        try:
+            if response:
+                await client.write_gatt_char(char_uuid, value, response=True)
+            else:
+                await client.write_gatt_char(char_uuid, value, response=False)
+            logger.info(f"Wrote to {mac} on {char_uuid}: {value.hex()}")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        
+    async def get_mtu(self, mac: str) -> int:
+        """
+        Get the Maximum Transmission Unit (MTU) size for a connected device.
+
+        :param mac: MAC of the device
+        :return: MTU size as an integer
+        :raises HTTPException: If device not connected
+        """
+        client = self._get_connected_client(mac)
+        if client._backend.__class__.__name__ == "BleakClientBlueZDBus":
+            await client._backend._acquire_mtu()
+        try:
+            mtu = client.mtu_size
+            logger.info(f"MTU for {mac}: {mtu}")
+            return mtu
+        except Exception as e:
+            logger.error(f"Failed to get MTU for {mac}: {e}")
+            raise HTTPException(status_code=400, detail="Failed to get MTU size")
 
     async def list_characteristics(self, mac: str):
         """

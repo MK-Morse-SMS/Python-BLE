@@ -101,6 +101,28 @@ class BLEManager:
         :raises HTTPException: If device not connected or read fails.
         """
         return await self.connections.read_characteristic(mac, char_uuid)
+    
+    async def write_characteristic(self, mac: str, char_uuid: str, value: bytes, resp: bool = False) -> None:
+        """
+        Write a value to a characteristic on a connected device.
+
+        :param mac: Device MAC address.
+        :param char_uuid: Characteristic UUID to write to.
+        :param value: The bytes value to write to the characteristic.
+        :param resp: Whether to wait for a response (default is False).
+        :raises HTTPException: If device not connected or write fails.
+        """
+        await self.connections.write_characteristic(mac, char_uuid, value, resp)
+
+    async def get_mtu(self, mac: str) -> int:
+        """
+        Get the Maximum Transmission Unit (MTU) size for a connected device.
+
+        :param mac: Device MAC address.
+        :return: The MTU size as an integer.
+        :raises HTTPException: If device not connected or unable to retrieve MTU.
+        """
+        return await self.connections.get_mtu(mac)
 
     async def enable_notification(self, mac: str, char_uuid: str) -> None:
         """
