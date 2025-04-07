@@ -16,12 +16,14 @@ logging.basicConfig(level=logging.INFO)
 # Create a single instance of BLEManager.
 ble_manager = BLEManager()
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize BLE manager during startup
     await ble_manager.initialize()
     yield
     await ble_manager.disconnect_all()
+
 
 # Create the FastAPI application
 app = FastAPI(lifespan=lifespan)
@@ -33,4 +35,5 @@ app.include_router(router)
 # uvicorn main:app --host 0.0.0.0 --port 8000
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000)

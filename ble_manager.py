@@ -26,7 +26,27 @@ class BLEManager:
 
         # Create sub-managers
         self.scanner = BLEScanner(event_broadcaster=self.event_broadcaster)
-        self.connections = BLEConnectionsManager(event_broadcaster=self.event_broadcaster)
+        self.connections = BLEConnectionsManager(
+            event_broadcaster=self.event_broadcaster
+        )
+
+        # Set up the device found callback to automatically check for connection
+        self.scanner.set_device_found_callback(self.handle_device_found)
+
+    def handle_device_found(self, device):
+        """
+        Callback function for when a device is found during scanning.
+        Automatically checks if the device should be connected.
+
+        :param device: The discovered BLEDevice.
+        """
+        mac = device.address
+        if (
+            mac in self.connections.desired_connections
+            and mac not in self.connections.connected_devices
+        ):
+            logger.info(f"Found desired device {mac}, connecting...")
+            self.connections.add_device(device)
 
     async def initialize(self) -> None:
         """
@@ -54,18 +74,23 @@ class BLEManager:
 
     async def add_device(self, mac: str) -> None:
         """
-        Add a device to the desired connections, triggering a background connection loop.
+        Add a device to the desired connections, triggering an immediate connection
+        if the device is currently known.
 
         :param mac: The MAC address of the BLE device to connect to.
         """
+        # First add to desired connections set
+        self.connections.desired_connections.add(mac)
+
         # Retrieve device from scanner cache if present
         device = await self.scanner.get_device(mac)
-        if not device:
-            logger.error(f"Device {mac} not found for connection.")
-            return
-
-        # Hand off to the connections manager
-        self.connections.add_device(device)
+        if device:
+            # Hand off to the connections manager
+            self.connections.add_device(device)
+        else:
+            logger.info(
+                f"Device {mac} added to desired connections, will connect when discovered."
+            )
 
     async def disconnect_device(self, mac: str) -> None:
         """
@@ -101,8 +126,10 @@ class BLEManager:
         :raises HTTPException: If device not connected or read fails.
         """
         return await self.connections.read_characteristic(mac, char_uuid)
-    
-    async def write_characteristic(self, mac: str, char_uuid: str, value: bytes, resp: bool = False) -> None:
+
+    async def write_characteristic(
+        self, mac: str, char_uuid: str, value: bytes, resp: bool = False
+    ) -> None:
         """
         Write a value to a characteristic on a connected device.
 

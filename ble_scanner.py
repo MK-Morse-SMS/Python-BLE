@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 
 from bleak import BleakScanner, BLEDevice, AdvertisementData
 from event_broadcaster import EventBroadcaster
@@ -14,6 +14,7 @@ class BLEScanner:
       - Start/stop scanning
       - Maintain a list of discovered devices
       - Broadcast scan events
+      - Notify when desired devices are discovered
     """
 
     def __init__(self, event_broadcaster: EventBroadcaster) -> None:
@@ -31,6 +32,9 @@ class BLEScanner:
 
         # Default scanning cycle duration (in seconds)
         self.scan_cycle: int = 300  # e.g., 5 minutes
+
+        # Callback for when devices are detected
+        self.device_found_callback: Optional[Callable[[BLEDevice], None]] = None
 
     async def start_scan(self, service_uuids: List[str]) -> Dict[str, str]:
         """
@@ -75,25 +79,14 @@ class BLEScanner:
             self.scan_task = None
 
         return {"status": "scanning stopped"}
-    
-    async def pause_scan(self) -> None:
-        """
-        Pause the scanning loop without stopping it.
-        """
-        if self.scan_task and not self.scan_task.done():
-            self.scan_task.cancel()
-            try:
-                await asyncio.wait_for(self.scan_task, timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
-            self.scan_task = None
 
-    async def resume_scan(self) -> None:
+    def set_device_found_callback(self, callback: Callable[[BLEDevice], None]) -> None:
         """
-        Resume the scanning loop if paused.
+        Set a callback to be called when a device is found during scanning.
+
+        :param callback: A function that takes a BLEDevice and handles it
         """
-        if self.scan_task is None or self.scan_task.done():
-            self.scan_task = asyncio.create_task(self._scan_loop())
+        self.device_found_callback = callback
 
     async def detection_callback(
         self, device: BLEDevice, advertisement_data: AdvertisementData
@@ -105,9 +98,15 @@ class BLEScanner:
         :param advertisement_data: Info about the advertisement packet.
         """
         # If service_uuids is not empty, we only push devices that match.
-        if device.name and (not self.scan_filters or any(
-            uuid in advertisement_data.service_uuids for uuid in self.scan_filters
-        )):
+        logger.debug(
+            f"Device found: {device.name} ({device.address}) with RSSI {advertisement_data.rssi}"
+        )
+        if device.name and (
+            not self.scan_filters
+            or any(
+                uuid in advertisement_data.service_uuids for uuid in self.scan_filters
+            )
+        ):
             # Track the device if not already present
             if device.address not in self.devices:
                 self.devices[device.address] = device
@@ -116,13 +115,19 @@ class BLEScanner:
             # Broadcast scan event
             event = {
                 "type": "scan",
-                "results": [{
-                    "bdaddr": device.address,
-                    "name": device.name,
-                    "rssi": advertisement_data.rssi,
-                }],
+                "results": [
+                    {
+                        "bdaddr": device.address,
+                        "name": device.name,
+                        "rssi": advertisement_data.rssi,
+                    }
+                ],
             }
             await self.event_broadcaster.broadcast(event)
+
+            # Notify the callback if set
+            if self.device_found_callback:
+                self.device_found_callback(device)
 
     async def _scan_loop(self) -> None:
         """
@@ -135,7 +140,7 @@ class BLEScanner:
                 self.active_scanner = BleakScanner(
                     detection_callback=self.detection_callback,
                     service_uuids=self.scan_filters,
-                    scanning_mode="active"
+                    scanning_mode="active",
                 )
 
                 # Start scanning
@@ -184,13 +189,6 @@ class BLEScanner:
         """
         device = self.devices.get(mac)
         # If the device is not found, try to specifically find it
-        if not device:
-            await self.pause_scan()
-            try:
-                device = await BleakScanner.find_device_by_address(mac)
-            except Exception as e:
-                logger.error(f"Error finding device {mac}: {str(e)}")
-            if device:
-                self.devices[mac] = device
-            await self.resume_scan()
+        if not device and self.active_scanner:
+            logger.info(f"Device {mac} found: {device is not None}")
         return device

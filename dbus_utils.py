@@ -6,9 +6,9 @@ from dbus_fast.constants import BusType
 logger = logging.getLogger(__name__)
 
 # D-Bus service and interface constants
-BLUEZ_SERVICE = 'org.bluez'
-OBJECT_MANAGER_INTERFACE = 'org.freedesktop.DBus.ObjectManager'
-DEVICE_INTERFACE = 'org.bluez.Device1'
+BLUEZ_SERVICE = "org.bluez"
+OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
+DEVICE_INTERFACE = "org.bluez.Device1"
 
 
 async def disconnect_all_devices() -> None:
@@ -37,7 +37,9 @@ async def disconnect_all_devices() -> None:
                 logger.info(f"Disconnecting device at D-Bus path: {path}")
                 # Get a proxy for the device to call its methods
                 device_introspection = await bus.introspect(BLUEZ_SERVICE, path)
-                device_obj = bus.get_proxy_object(BLUEZ_SERVICE, path, device_introspection)
+                device_obj = bus.get_proxy_object(
+                    BLUEZ_SERVICE, path, device_introspection
+                )
                 device = device_obj.get_interface(DEVICE_INTERFACE)
                 try:
                     # Call the Disconnect method

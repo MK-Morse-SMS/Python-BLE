@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import Dict, Set
 
-from bleak import BleakClient, BleakScanner, BLEDevice
+from bleak import BleakClient, BLEDevice
 from event_broadcaster import EventBroadcaster
 from fastapi import HTTPException
 
@@ -13,7 +13,7 @@ class BLEConnectionsManager:
     """
     Manages and maintains active BLE connections. It handles:
       - Desired connection set
-      - Connection loops for each device
+      - On-demand connections to devices
       - Reading/writing/notifications for connected devices
     """
 
@@ -29,28 +29,33 @@ class BLEConnectionsManager:
         # Current connected device clients
         self.connected_devices: Dict[str, BleakClient] = {}
 
-        # Tasks that manage the connection loops, keyed by MAC
-        self.connection_tasks: Dict[str, asyncio.Task] = {}
-
         # Lock to prevent race conditions when scanning and connecting
         self.connection_lock = asyncio.Lock()
 
         # Store device names separately from the BleakClient objects
         self.device_names: Dict[str, str] = {}
 
+        # Store devices keyed by MAC
+        self.known_devices: Dict[str, BLEDevice] = {}
+
     def add_device(self, device: BLEDevice) -> None:
         """
-        Add a device to desired connections and start a connection task.
+        Add a device to desired connections and connect if not already connected.
 
         :param device: BLEDevice instance. We'll use device.address as the key.
         """
         mac = device.address
+
+        # Store device in known devices
+        self.known_devices[mac] = device
+
+        # If this is a desired connection and not already connected, connect now
         if mac not in self.desired_connections:
             self.desired_connections.add(mac)
-            # Start background task for connection management
-            self.connection_tasks[mac] = asyncio.create_task(
-                self._connection_loop(device)
-            )
+
+        if mac not in self.connected_devices and mac in self.desired_connections:
+            # Start a task to connect to the device
+            asyncio.create_task(self._connect_to_device(device))
 
     async def disconnect_device(self, mac: str) -> None:
         """
@@ -60,11 +65,6 @@ class BLEConnectionsManager:
         """
         if mac in self.desired_connections:
             self.desired_connections.remove(mac)
-
-        # Cancel the connection loop if it exists
-        if mac in self.connection_tasks:
-            task = self.connection_tasks.pop(mac)
-            task.cancel()
 
         # If the device is connected, disconnect it
         if mac in self.connected_devices:
@@ -100,8 +100,10 @@ class BLEConnectionsManager:
             return value.hex()
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
-        
-    async def write_characteristic(self, mac: str, char_uuid: str, value: bytes, response: bool = False) -> None:
+
+    async def write_characteristic(
+        self, mac: str, char_uuid: str, value: bytes, response: bool = False
+    ) -> None:
         """
         Write a value to a characteristic on a connected device.
 
@@ -120,7 +122,7 @@ class BLEConnectionsManager:
             logger.info(f"Wrote to {mac} on {char_uuid}: {value.hex()}")
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
-        
+
     async def get_mtu(self, mac: str) -> int:
         """
         Get the Maximum Transmission Unit (MTU) size for a connected device.
@@ -151,11 +153,13 @@ class BLEConnectionsManager:
         characteristics = []
         for service in client.services:
             for char in service.characteristics:
-                characteristics.append({
-                    "uuid": char.uuid,
-                    "properties": char.properties,
-                    "description": getattr(char, "description", "")
-                })
+                characteristics.append(
+                    {
+                        "uuid": char.uuid,
+                        "properties": char.properties,
+                        "description": getattr(char, "description", ""),
+                    }
+                )
         logger.info(f"Characteristics for {mac}: {characteristics}")
         return characteristics
 
@@ -168,7 +172,7 @@ class BLEConnectionsManager:
         :raises HTTPException: If device not connected
         """
         client = self._get_connected_client(mac)
-        
+
         # Try disabling notifications first to avoid potential issues
         try:
             await client.stop_notify(char_uuid)
@@ -176,12 +180,16 @@ class BLEConnectionsManager:
             pass
 
         def notification_handler(sender, data):
-            asyncio.create_task(self.event_broadcaster.broadcast({
-                "type": "notification",
-                "bdaddr": mac,
-                "characteristic": char_uuid,
-                "data": data.hex()
-            }))
+            asyncio.create_task(
+                self.event_broadcaster.broadcast(
+                    {
+                        "type": "notification",
+                        "bdaddr": mac,
+                        "characteristic": char_uuid,
+                        "data": data.hex(),
+                    }
+                )
+            )
 
         try:
             await client.start_notify(char_uuid, notification_handler)
@@ -215,77 +223,81 @@ class BLEConnectionsManager:
                     except Exception:
                         pass
 
-    async def _connection_loop(self, device: BLEDevice) -> None:
+    async def _connect_to_device(self, device: BLEDevice) -> None:
         """
-        Continuously try to connect/reconnect to the given device.
+        Connect to a specific BLE device.
+
+        :param device: The BLE device to connect to.
         """
         mac = device.address
-        logger.info(f"Starting connection loop for {mac}.")
 
-        # This event is used to wait for disconnection callbacks
-        disconnect_event = asyncio.Event()
+        if mac not in self.desired_connections or mac in self.connected_devices or self.connection_lock.locked():
+            logger.info(
+                f"Skipping connection to {mac}: not in desired connections or already connected."
+            )
+            return
+        logger.debug(f"Attempting to connect to {mac}...")
 
-        def _disconnection_handler(_client):
-            logger.warning(f"Connection to {mac} dropped.")
-            self.connected_devices.pop(mac, None)
-            # Broadcast disconnection asynchronously
-            asyncio.create_task(self._broadcast_disconnection(mac))
-            disconnect_event.set()
+        async with self.connection_lock:
+            # Skip if this device is already connected
+            if mac in self.connected_devices:
+                return
 
-        while mac in self.desired_connections:
-            try:
-                disconnect_event.clear()
-                async with self.connection_lock:
-                    # Attempt to connect
-                    client = BleakClient(device, disconnected_callback=_disconnection_handler)
-                    logger.debug(f"Connecting to {mac}...")
-                    await client.connect()
-                    self.connected_devices[mac] = client
-
-                    # Try to read the device name characteristic (0x2A00)
-                    try:
-                        # First save the advertised name as fallback
-                        if device.name:
-                            self.device_names[mac] = device.name
-                        
-                        # Now try to read the actual characteristic
-                        # 0x2A00 is the Device Name characteristic in Generic Access service
-                        device_name_bytes = await client.read_gatt_char("00002a00-0000-1000-8000-00805f9b34fb")
-                        if device_name_bytes:
-                            try:
-                                # Convert bytes to string and store it
-                                device_name = device_name_bytes.decode('utf-8')
-                                self.device_names[mac] = device_name
-                                logger.info(f"Read device name for {mac}: {device_name}")
-                            except UnicodeDecodeError:
-                                logger.warning(f"Could not decode device name for {mac}")
-                    except Exception as e:
-                        logger.debug(f"Could not read device name characteristic for {mac}: {e}")
-                        # Use advertised name or address as fallback if we couldn't read the name
-                        if mac not in self.device_names:
-                            self.device_names[mac] = device.name or mac
-                    
-                    logger.info(f"Successfully connected to {mac}.")
-                    await self._broadcast_connection(mac, "connected")
-
-                # Wait for disconnection
-                await disconnect_event.wait()
-
-                # Connection was dropped, loop repeats to attempt reconnect
-            except asyncio.CancelledError:
-                logger.info(f"Connection loop cancelled for {mac}.")
-                # Clean up if needed
+            def _disconnection_handler(_client):
+                logger.warning(f"Connection to {mac} dropped.")
                 self.connected_devices.pop(mac, None)
-                break
+                # Broadcast disconnection asynchronously
+                asyncio.create_task(self._broadcast_disconnection(mac))
+                # Attempt to reconnect if still desired
+                if mac in self.desired_connections and mac in self.known_devices:
+                    # Add a small delay before reconnection attempt
+                    asyncio.create_task(
+                        self._delayed_reconnect(self.known_devices[mac])
+                    )
+
+            try:
+
+                # Attempt to connect
+                client = BleakClient(
+                    device, disconnected_callback=_disconnection_handler, timeout=10.0
+                )
+                logger.debug(f"Connecting to {mac}...")
+                await client.connect()
+                self.connected_devices[mac] = client
+
+                # Try to read the device name characteristic (0x2A00)
+                try:
+                    # First save the advertised name as fallback
+                    if device.name:
+                        self.device_names[mac] = device.name
+
+                    # Now try to read the actual characteristic
+                    # 0x2A00 is the Device Name characteristic in Generic Access service
+                    device_name_bytes = await client.read_gatt_char(
+                        "00002a00-0000-1000-8000-00805f9b34fb"
+                    )
+                    if device_name_bytes:
+                        try:
+                            # Convert bytes to string and store it
+                            device_name = device_name_bytes.decode("utf-8")
+                            self.device_names[mac] = device_name
+                            logger.info(f"Read device name for {mac}: {device_name}")
+                        except UnicodeDecodeError:
+                            logger.warning(f"Could not decode device name for {mac}")
+                except Exception as e:
+                    logger.debug(
+                        f"Could not read device name characteristic for {mac}: {e}"
+                    )
+                    # Use advertised name or address as fallback if we couldn't read the name
+                    if mac not in self.device_names:
+                        self.device_names[mac] = device.name or mac
+
+                logger.info(f"Successfully connected to {mac}.")
+                await self._broadcast_connection(mac, "connected")
+
             except Exception as e:
                 logger.error(f"Error connecting to {mac}: {e}", exc_info=True)
                 self.connected_devices.pop(mac, None)
-                # Brief pause before retry
-                await asyncio.sleep(5)
-
-            await asyncio.sleep(1)
-
-        logger.debug(f"Exiting connection loop for {mac}.")
 
     def _get_connected_client(self, mac: str) -> BleakClient:
         """
@@ -299,11 +311,9 @@ class BLEConnectionsManager:
         """
         Helper to broadcast a connection-status event.
         """
-        await self.event_broadcaster.broadcast({
-            "type": "connection",
-            "bdaddr": mac,
-            "status": status
-        })
+        await self.event_broadcaster.broadcast(
+            {"type": "connection", "bdaddr": mac, "status": status}
+        )
 
     async def _broadcast_disconnection(self, mac: str) -> None:
         """
@@ -315,4 +325,8 @@ class BLEConnectionsManager:
         """
         Return a dictionary of connected devices (MAC: name).
         """
-        return {mac: name for mac, name in self.device_names.items()}
+        return {
+            mac: name
+            for mac, name in self.device_names.items()
+            if mac in self.connected_devices
+        }
