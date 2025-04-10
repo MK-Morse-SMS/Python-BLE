@@ -298,6 +298,26 @@ class BLEConnectionsManager:
             except Exception as e:
                 logger.error(f"Error connecting to {mac}: {e}", exc_info=True)
                 self.connected_devices.pop(mac, None)
+                # Attempt to reconnect if desired
+                if mac in self.desired_connections and mac in self.known_devices:
+                    # Add a small delay before reconnection attempt
+                    asyncio.create_task(
+                        self._delayed_reconnect(self.known_devices[mac])
+                    )
+                else:
+                    logger.info(
+                        f"Device {mac} is not in desired connections, not attempting to reconnect."
+                    )
+                await self._broadcast_disconnection(mac)
+
+    async def _delayed_reconnect(self, device: BLEDevice) -> None:
+        """
+        Wait a bit before attempting to reconnect to avoid rapid reconnection attempts.
+        :param device: The device to reconnect to.
+        """
+        await asyncio.sleep(5)  # Wait 5 seconds before reconnecting
+        if device.address in self.desired_connections:
+            await self._connect_to_device(device)
 
     def _get_connected_client(self, mac: str) -> BleakClient:
         """
