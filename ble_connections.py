@@ -136,7 +136,7 @@ class BLEConnectionsManager:
             await client._backend._acquire_mtu()
         try:
             mtu = client.mtu_size
-            logger.info(f"MTU for {mac}: {mtu}")
+            logger.debug(f"MTU for {mac}: {mtu}")
             return mtu
         except Exception as e:
             logger.error(f"Failed to get MTU for {mac}: {e}")
@@ -160,7 +160,7 @@ class BLEConnectionsManager:
                         "description": getattr(char, "description", ""),
                     }
                 )
-        logger.info(f"Characteristics for {mac}: {characteristics}")
+        logger.debug(f"Characteristics for {mac}: {characteristics}")
         return characteristics
 
     async def enable_notification(self, mac: str, char_uuid: str) -> None:
