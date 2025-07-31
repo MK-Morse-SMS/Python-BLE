@@ -1,16 +1,16 @@
 meta {
-  name: Enable Notifications
+  name: Read Characteristic
   type: http
-  seq: 7
+  seq: 12
 }
 
-post {
+get {
   url: {{URL}}/gatt/nodes/{{node}}/characteristic/{{characteristic}}
   body: none
   auth: none
 }
 
 vars:pre-request {
-  node: CA:70:C9:29:B8:60
-  characteristic: 00002a19-0000-1000-8000-00805f9b34fb
+  node: DE:6D:5D:2A:BD:58
+  characteristic: 00002a00-0000-1000-8000-00805f9b34fb
 }

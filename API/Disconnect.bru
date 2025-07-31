@@ -5,7 +5,7 @@ meta {
 }
 
 delete {
-  url: http://sawmonitor.local:8000/gap/nodes/{{node}}
+  url: {{URL}}/gap/nodes/{{node}}
   body: none
   auth: none
 }
@@ -19,5 +19,5 @@ body:json {
 }
 
 vars:pre-request {
-  node: CA:70:C9:29:B8:60
+  node: DE:6D:5D:2A:BD:58
 }
