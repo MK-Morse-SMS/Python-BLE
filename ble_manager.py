@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Mapping
 
 from event_broadcaster import EventBroadcaster
 
@@ -55,7 +55,7 @@ class BLEManager:
         """
         await disconnect_all_devices()
 
-    async def start_scan(self, service_uuids: List[str]) -> Dict[str, str]:
+    async def start_scan(self, service_uuids: List[str]) -> Mapping[str, Any]:
         """
         Public method to initiate BLE scanning with optional service UUID filters.
 
@@ -175,7 +175,7 @@ class BLEManager:
         """
         await self.connections.disable_all_notifications()
 
-    async def get_connected_devices(self) -> Dict[str, str]:
+    async def get_connected_devices(self) -> Mapping[str, Any]:
         """
         Return a dictionary of connected devices (MAC: name).
 

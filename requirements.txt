@@ -1,6 +1,5 @@
-asyncio
-fastapi
-uvicorn
-pydantic
-bleak==0.22.3
-dbus-fast
+fastapi==0.129.0
+uvicorn==0.41.0
+pydantic==2.12.5
+bleak==2.1.1
+dbus-fast==4.0.0

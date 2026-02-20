@@ -2,7 +2,9 @@ import asyncio
 import logging
 from typing import List, Dict, Optional, Callable
 
-from bleak import BleakScanner, BLEDevice, AdvertisementData
+from bleak import BleakScanner
+from bleak.backends.scanner import AdvertisementData
+from bleak.backends.device import BLEDevice
 from event_broadcaster import EventBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -36,7 +38,7 @@ class BLEScanner:
         # Callback for when devices are detected
         self.device_found_callback: Optional[Callable[[BLEDevice], None]] = None
 
-    async def start_scan(self, service_uuids: List[str]) -> Dict[str, str]:
+    async def start_scan(self, service_uuids: List[str]) -> Dict[str, str | List[str]]:
         """
         Begin scanning for BLE devices, optionally filtering by service UUIDs.
 

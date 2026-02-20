@@ -2,7 +2,9 @@ import asyncio
 import logging
 from typing import Dict, Set
 
-from bleak import BleakClient, BLEDevice
+from bleak import BleakClient
+from bleak.backends import BleakBackend
+from bleak.backends.device import BLEDevice
 from event_broadcaster import EventBroadcaster
 from fastapi import HTTPException
 
@@ -132,8 +134,8 @@ class BLEConnectionsManager:
         :raises HTTPException: If device not connected
         """
         client = self._get_connected_client(mac)
-        if client._backend.__class__.__name__ == "BleakClientBlueZDBus":
-            await client._backend._acquire_mtu()
+        if client.backend_id == BleakBackend.BLUEZ_DBUS:
+            await client._backend._acquire_mtu()  # type: ignore
         try:
             mtu = client.mtu_size
             logger.debug(f"MTU for {mac}: {mtu}")
