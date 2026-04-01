@@ -210,4 +210,3 @@ async def sse_events(
     )
 
 
-# write charac
