@@ -1,14 +1,25 @@
 import asyncio
 import logging
+import os
+import time
 from typing import Dict, Set
 
 from bleak import BleakClient
 from bleak.backends import BleakBackend
 from bleak.backends.device import BLEDevice
+from dbus_utils import remove_device, reset_adapter
 from event_broadcaster import EventBroadcaster
 from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
+
+# Recovery tunables. A short-lived connection (connect succeeds then drops
+# within SHORT_CONNECTION_SECONDS) counts as a failure — that's the signature
+# of BlueZ wedged state, which is the failure mode this recovery exists for.
+SHORT_CONNECTION_SECONDS = 15
+REMOVE_DEVICE_THRESHOLD = 3
+RESET_ADAPTER_THRESHOLD = 6
+EXIT_THRESHOLD = 10
 
 
 class BLEConnectionsManager:
@@ -39,6 +50,20 @@ class BLEConnectionsManager:
 
         # Store devices keyed by MAC
         self.known_devices: Dict[str, BLEDevice] = {}
+
+        # Per-MAC consecutive failure count, driving the recovery escalation
+        # ladder (see _register_failure).
+        self.connection_failures: Dict[str, int] = {}
+
+        # Per-MAC monotonic timestamp of the most recent successful connect.
+        # Used to classify short-lived drops (< SHORT_CONNECTION_SECONDS) as
+        # failures and long-lived drops as benign.
+        self.connect_times: Dict[str, float] = {}
+
+        # Held while a recovery step (RemoveDevice / adapter power-cycle) is
+        # in flight. Prevents concurrent recoveries and pauses new connect
+        # attempts so we don't race with BlueZ state being torn down.
+        self.recovery_lock = asyncio.Lock()
 
     def add_device(self, device: BLEDevice) -> None:
         """
@@ -233,10 +258,17 @@ class BLEConnectionsManager:
         """
         mac = device.address
 
-        if mac not in self.desired_connections or mac in self.connected_devices or self.connection_lock.locked():
-            logger.info(
-                f"Skipping connection to {mac}: not in desired connections or already connected."
-            )
+        if self.recovery_lock.locked():
+            logger.info(f"Skipping {mac}: BLE recovery in progress.")
+            return
+        if mac not in self.desired_connections:
+            logger.info(f"Skipping {mac}: not in desired connections.")
+            return
+        if mac in self.connected_devices:
+            logger.debug(f"Skipping {mac}: already connected.")
+            return
+        if self.connection_lock.locked():
+            logger.debug(f"Skipping {mac}: another connect attempt in progress.")
             return
         logger.debug(f"Attempting to connect to {mac}...")
 
@@ -248,8 +280,20 @@ class BLEConnectionsManager:
             def _disconnection_handler(_client):
                 logger.warning(f"Connection to {mac} dropped.")
                 self.connected_devices.pop(mac, None)
+                connect_time = self.connect_times.pop(mac, None)
                 # Broadcast disconnection asynchronously
                 asyncio.create_task(self._broadcast_disconnection(mac))
+
+                # A drop within SHORT_CONNECTION_SECONDS of a successful
+                # connect is the BlueZ-wedge signature; a longer-lived
+                # connection ending is normal and resets the counter.
+                if connect_time is not None:
+                    uptime = time.monotonic() - connect_time
+                    if uptime < SHORT_CONNECTION_SECONDS:
+                        asyncio.create_task(self._register_failure(mac))
+                    else:
+                        self.connection_failures.pop(mac, None)
+
                 # Attempt to reconnect if still desired
                 if mac in self.desired_connections and mac in self.known_devices:
                     # Add a small delay before reconnection attempt
@@ -294,12 +338,15 @@ class BLEConnectionsManager:
                     if mac not in self.device_names:
                         self.device_names[mac] = device.name or mac
 
+                self.connect_times[mac] = time.monotonic()
                 logger.info(f"Successfully connected to {mac}.")
                 await self._broadcast_connection(mac, "connected")
 
             except Exception as e:
                 logger.error(f"Error connecting to {mac}: {e}", exc_info=True)
                 self.connected_devices.pop(mac, None)
+                self.connect_times.pop(mac, None)
+                asyncio.create_task(self._register_failure(mac))
                 # Attempt to reconnect if desired
                 if mac in self.desired_connections and mac in self.known_devices:
                     # Add a small delay before reconnection attempt
@@ -320,6 +367,55 @@ class BLEConnectionsManager:
         await asyncio.sleep(5)  # Wait 5 seconds before reconnecting
         if device.address in self.desired_connections:
             await self._connect_to_device(device)
+
+    async def _register_failure(self, mac: str) -> None:
+        """
+        Record a connect failure (or short-lived drop) for ``mac`` and run the
+        recovery escalation ladder when thresholds are crossed:
+
+          * REMOVE_DEVICE_THRESHOLD — clear this device from BlueZ's cache
+          * RESET_ADAPTER_THRESHOLD — power-cycle the BLE adapter
+          * EXIT_THRESHOLD          — os._exit(1) so Balena restarts the container
+
+        Only one recovery runs at a time (``recovery_lock``); concurrent
+        failures from other MACs just bump their counters and return.
+        """
+        n = self.connection_failures.get(mac, 0) + 1
+        self.connection_failures[mac] = n
+        logger.warning(f"BLE failure #{n} for {mac}")
+
+        if self.recovery_lock.locked():
+            return
+
+        async with self.recovery_lock:
+            if n >= EXIT_THRESHOLD:
+                logger.error(
+                    f"BLE wedged after {n} consecutive failures for {mac}; "
+                    f"exiting for container restart"
+                )
+                os._exit(1)
+            elif n >= RESET_ADAPTER_THRESHOLD:
+                logger.warning(
+                    f"Resetting BLE adapter after {n} consecutive failures for {mac}"
+                )
+                # An adapter power-cycle invalidates every BleakClient and
+                # wipes BlueZ's view of all devices.
+                self.connected_devices.clear()
+                self.connect_times.clear()
+                try:
+                    await reset_adapter()
+                except Exception as e:
+                    logger.error(f"reset_adapter failed: {e}", exc_info=True)
+                self.connection_failures.clear()
+            elif n >= REMOVE_DEVICE_THRESHOLD:
+                logger.warning(
+                    f"Removing {mac} from BlueZ cache after {n} consecutive failures"
+                )
+                try:
+                    await remove_device(mac)
+                except Exception as e:
+                    logger.error(f"remove_device({mac}) failed: {e}", exc_info=True)
+                self.connection_failures[mac] = 0
 
     def _get_connected_client(self, mac: str) -> BleakClient:
         """
