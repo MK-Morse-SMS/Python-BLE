@@ -21,6 +21,17 @@ REMOVE_DEVICE_THRESHOLD = 3
 RESET_ADAPTER_THRESHOLD = 6
 EXIT_THRESHOLD = 10
 
+# Reconnect-backoff tunables. Connects are serialized through a single lock,
+# so a flaky sensor that keeps dropping can monopolise the slot and starve
+# healthy ones. Each failure event bumps a per-device flakiness score; the
+# reconnect delay grows exponentially with that score (base * 2**score),
+# capped at RECONNECT_MAX_SECONDS. The score decays with wall-clock time
+# (halving every FLAKINESS_HALF_LIFE_SECONDS), so a device that recovers
+# drifts back to the base delay on its own — no explicit reset needed.
+RECONNECT_BASE_SECONDS = 5
+RECONNECT_MAX_SECONDS = 60
+FLAKINESS_HALF_LIFE_SECONDS = 300
+
 
 class BLEConnectionsManager:
     """
@@ -59,6 +70,15 @@ class BLEConnectionsManager:
         # Used to classify short-lived drops (< SHORT_CONNECTION_SECONDS) as
         # failures and long-lived drops as benign.
         self.connect_times: Dict[str, float] = {}
+
+        # Per-MAC flakiness score and the monotonic time it was last updated.
+        # Distinct from connection_failures (which drives the recovery ladder
+        # and gets reset by recovery steps): this score is never reset by
+        # recovery, only decayed with time, so it reflects a device's *recent*
+        # reliability and feeds the reconnect backoff that deprioritises flaky
+        # sensors without permanently starving them.
+        self.flakiness: Dict[str, float] = {}
+        self.flakiness_updated: Dict[str, float] = {}
 
         # Held while a recovery step (RemoveDevice / adapter power-cycle) is
         # in flight. Prevents concurrent recoveries and pauses new connect
@@ -361,12 +381,47 @@ class BLEConnectionsManager:
 
     async def _delayed_reconnect(self, device: BLEDevice) -> None:
         """
-        Wait a bit before attempting to reconnect to avoid rapid reconnection attempts.
+        Wait before attempting to reconnect to avoid rapid reconnection attempts.
+        The wait scales with the device's flakiness so flaky sensors back off
+        and stop starving healthy ones of the single connection slot.
+
         :param device: The device to reconnect to.
         """
-        await asyncio.sleep(5)  # Wait 5 seconds before reconnecting
+        delay = self._reconnect_delay(device.address)
+        await asyncio.sleep(delay)
         if device.address in self.desired_connections:
             await self._connect_to_device(device)
+
+    def _current_flakiness(self, mac: str) -> float:
+        """
+        Return ``mac``'s flakiness score decayed to the present moment. The
+        score halves every FLAKINESS_HALF_LIFE_SECONDS, so a device that stops
+        failing drifts back toward zero on its own.
+        """
+        score = self.flakiness.get(mac, 0.0)
+        if score <= 0.0:
+            return 0.0
+        elapsed = time.monotonic() - self.flakiness_updated.get(mac, 0.0)
+        return score * (0.5 ** (elapsed / FLAKINESS_HALF_LIFE_SECONDS))
+
+    def _bump_flakiness(self, mac: str) -> float:
+        """
+        Increment ``mac``'s decayed flakiness score by one and stamp it now.
+        Called on every connect failure / short-lived drop.
+        """
+        score = self._current_flakiness(mac) + 1.0
+        self.flakiness[mac] = score
+        self.flakiness_updated[mac] = time.monotonic()
+        return score
+
+    def _reconnect_delay(self, mac: str) -> float:
+        """
+        Reconnect backoff for ``mac``: RECONNECT_BASE_SECONDS for a healthy
+        device, growing exponentially with its flakiness score and capped at
+        RECONNECT_MAX_SECONDS.
+        """
+        delay = RECONNECT_BASE_SECONDS * (2 ** self._current_flakiness(mac))
+        return min(delay, RECONNECT_MAX_SECONDS)
 
     async def _register_failure(self, mac: str) -> None:
         """
@@ -382,7 +437,15 @@ class BLEConnectionsManager:
         only one recovery runs at a time. Counters only reset when a recovery
         step *succeeds*; a failed step leaves the counter intact so the next
         failure escalates instead of restarting from zero.
+
+        This is also the single funnel for every connect failure / short-lived
+        drop, so it's where we bump the per-device flakiness score that drives
+        reconnect backoff.
         """
+        # Bump flakiness regardless of recovery state; the reconnect backoff
+        # reads this to deprioritise this device relative to healthy ones.
+        self._bump_flakiness(mac)
+
         async with self.recovery_lock:
             n = self.connection_failures.get(mac, 0) + 1
             self.connection_failures[mac] = n
