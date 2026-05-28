@@ -377,17 +377,17 @@ class BLEConnectionsManager:
           * RESET_ADAPTER_THRESHOLD — power-cycle the BLE adapter
           * EXIT_THRESHOLD          — os._exit(1) so Balena restarts the container
 
-        Only one recovery runs at a time (``recovery_lock``); concurrent
-        failures from other MACs just bump their counters and return.
+        All state mutation and recovery actions run under ``recovery_lock``
+        so concurrent failures serialize cleanly — increments aren't lost and
+        only one recovery runs at a time. Counters only reset when a recovery
+        step *succeeds*; a failed step leaves the counter intact so the next
+        failure escalates instead of restarting from zero.
         """
-        n = self.connection_failures.get(mac, 0) + 1
-        self.connection_failures[mac] = n
-        logger.warning(f"BLE failure #{n} for {mac}")
-
-        if self.recovery_lock.locked():
-            return
-
         async with self.recovery_lock:
+            n = self.connection_failures.get(mac, 0) + 1
+            self.connection_failures[mac] = n
+            logger.warning(f"BLE failure #{n} for {mac}")
+
             if n >= EXIT_THRESHOLD:
                 logger.error(
                     f"BLE wedged after {n} consecutive failures for {mac}; "
@@ -406,7 +406,8 @@ class BLEConnectionsManager:
                     await reset_adapter()
                 except Exception as e:
                     logger.error(f"reset_adapter failed: {e}", exc_info=True)
-                self.connection_failures.clear()
+                else:
+                    self.connection_failures.clear()
             elif n >= REMOVE_DEVICE_THRESHOLD:
                 logger.warning(
                     f"Removing {mac} from BlueZ cache after {n} consecutive failures"
@@ -415,7 +416,8 @@ class BLEConnectionsManager:
                     await remove_device(mac)
                 except Exception as e:
                     logger.error(f"remove_device({mac}) failed: {e}", exc_info=True)
-                self.connection_failures[mac] = 0
+                else:
+                    self.connection_failures[mac] = 0
 
     def _get_connected_client(self, mac: str) -> BleakClient:
         """
