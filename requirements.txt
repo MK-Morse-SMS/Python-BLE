@@ -1,5 +1,5 @@
 fastapi==0.136.1
-uvicorn==0.47.0
+uvicorn==0.48.0
 pydantic==2.12.5
 bleak==3.0.1
-dbus-fast==4.0.0
+dbus-fast==5.0.16

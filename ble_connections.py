@@ -14,10 +14,17 @@ from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 # Recovery tunables. A short-lived connection (connect succeeds then drops
-# within SHORT_CONNECTION_SECONDS) counts as a failure — that's the signature
-# of BlueZ wedged state, which is the failure mode this recovery exists for.
+# within SHORT_CONNECTION_SECONDS) counts as a failure.
+#
+# On Linux kernel 6.x, BlueZ cannot connect to a device that has aged out of
+# its cache, even while an active scan is running (bleak #1244) — the connect
+# fails with TimeoutError or "device '...' not found". The reliable fix is to
+# RemoveDevice from BlueZ's cache, forcing a fresh re-discovery on the next
+# advertisement. Because that's the *common* cause on our edge kernel (not a
+# rare wedge), we remove on the very first failure rather than waiting for a
+# streak to build up.
 SHORT_CONNECTION_SECONDS = 15
-REMOVE_DEVICE_THRESHOLD = 3
+REMOVE_DEVICE_THRESHOLD = 1
 RESET_ADAPTER_THRESHOLD = 6
 EXIT_THRESHOLD = 10
 
@@ -434,9 +441,14 @@ class BLEConnectionsManager:
 
         All state mutation and recovery actions run under ``recovery_lock``
         so concurrent failures serialize cleanly — increments aren't lost and
-        only one recovery runs at a time. Counters only reset when a recovery
-        step *succeeds*; a failed step leaves the counter intact so the next
-        failure escalates instead of restarting from zero.
+        only one recovery runs at a time. The counter climbs with every failure
+        and escalates up the rungs; it is reset only by an adapter-reset success
+        (clears all counters) or by a healthy long-lived connection later
+        dropping (see ``_disconnection_handler``). RemoveDevice runs on every
+        failure (it's the kernel-6.x cache-aging fix, threshold == 1) and
+        deliberately does NOT reset the counter — otherwise a device stuck at
+        "remove, retry, fail" would peg the counter at 1 and never escalate to
+        the adapter reset / exit rungs.
 
         This is also the single funnel for every connect failure / short-lived
         drop, so it's where we bump the per-device flakiness score that drives
@@ -472,15 +484,15 @@ class BLEConnectionsManager:
                 else:
                     self.connection_failures.clear()
             elif n >= REMOVE_DEVICE_THRESHOLD:
-                logger.warning(
-                    f"Removing {mac} from BlueZ cache after {n} consecutive failures"
-                )
+                logger.warning(f"Removing {mac} from BlueZ cache after failure #{n}")
                 try:
                     await remove_device(mac)
                 except Exception as e:
                     logger.error(f"remove_device({mac}) failed: {e}", exc_info=True)
-                else:
-                    self.connection_failures[mac] = 0
+                # Intentionally do NOT reset connection_failures here: with
+                # REMOVE_DEVICE_THRESHOLD == 1 every failure removes the device,
+                # and resetting would peg the counter at 1, making the
+                # adapter-reset / exit rungs above unreachable. Let it climb.
 
     def _get_connected_client(self, mac: str) -> BleakClient:
         """
