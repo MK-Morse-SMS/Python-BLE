@@ -39,6 +39,34 @@ RECONNECT_BASE_SECONDS = 5
 RECONNECT_MAX_SECONDS = 60
 FLAKINESS_HALF_LIFE_SECONDS = 300
 
+# Every GATT operation is a D-Bus round-trip to BlueZ, and BlueZ does not always
+# reply. If the device disconnects mid-call — or the device object is removed
+# from BlueZ's cache while a call is in flight, which is exactly what our own
+# recovery path does on failure — the await can hang forever. That leaves the
+# HTTP request open indefinitely, and the backend blocked on it. Bound every
+# GATT call so a wedged operation surfaces as an error instead.
+GATT_OP_TIMEOUT_SECONDS = 10
+
+
+async def _gatt_op(coro, description: str):
+    """
+    Await a GATT coroutine under a timeout.
+
+    :param coro: The coroutine performing the GATT operation.
+    :param description: Human-readable operation description, used in the error.
+    :raises HTTPException: 504 if the operation did not complete in time.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=GATT_OP_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error(
+            f"GATT operation timed out after {GATT_OP_TIMEOUT_SECONDS}s: {description}"
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=f"GATT operation timed out: {description}",
+        )
+
 
 class BLEConnectionsManager:
     """
@@ -124,7 +152,13 @@ class BLEConnectionsManager:
         if mac in self.connected_devices:
             client = self.connected_devices.pop(mac)
             try:
-                await client.disconnect()
+                # Bounded: a disconnect that never returns would otherwise hang
+                # the request. The client is already dropped from
+                # connected_devices, so treat a timeout like any other failure
+                # and carry on to the broadcast.
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=GATT_OP_TIMEOUT_SECONDS
+                )
             except Exception as e:
                 logger.debug(f"Error disconnecting {mac}: {e}")
             await self._broadcast_disconnection(mac)
@@ -150,8 +184,12 @@ class BLEConnectionsManager:
         """
         client = self._get_connected_client(mac)
         try:
-            value = await client.read_gatt_char(char_uuid)
+            value = await _gatt_op(
+                client.read_gatt_char(char_uuid), f"read {mac}/{char_uuid}"
+            )
             return value.hex()
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -169,11 +207,13 @@ class BLEConnectionsManager:
         """
         client = self._get_connected_client(mac)
         try:
-            if response:
-                await client.write_gatt_char(char_uuid, value, response=True)
-            else:
-                await client.write_gatt_char(char_uuid, value, response=False)
+            await _gatt_op(
+                client.write_gatt_char(char_uuid, value, response=response),
+                f"write {mac}/{char_uuid}",
+            )
             logger.info(f"Wrote to {mac} on {char_uuid}: {value.hex()}")
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -187,7 +227,10 @@ class BLEConnectionsManager:
         """
         client = self._get_connected_client(mac)
         if client.backend_id == BleakBackend.BLUEZ_DBUS:
-            await client._backend._acquire_mtu()  # type: ignore
+            await _gatt_op(
+                client._backend._acquire_mtu(),  # type: ignore
+                f"acquire_mtu {mac}",
+            )
         try:
             mtu = client.mtu_size
             logger.debug(f"MTU for {mac}: {mtu}")
@@ -229,7 +272,14 @@ class BLEConnectionsManager:
 
         # Try disabling notifications first to avoid potential issues
         try:
-            await client.stop_notify(char_uuid)
+            await _gatt_op(
+                client.stop_notify(char_uuid), f"stop_notify {mac}/{char_uuid}"
+            )
+        except HTTPException:
+            # A timeout here means BlueZ is not answering for this device; the
+            # start_notify below would hang the same way, so give up now rather
+            # than holding the request open for a second timeout.
+            raise
         except Exception:
             pass
 
@@ -246,7 +296,12 @@ class BLEConnectionsManager:
             )
 
         try:
-            await client.start_notify(char_uuid, notification_handler)
+            await _gatt_op(
+                client.start_notify(char_uuid, notification_handler),
+                f"start_notify {mac}/{char_uuid}",
+            )
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
         logger.info(f"Enabled notifications for {mac} on {char_uuid}")
@@ -261,7 +316,11 @@ class BLEConnectionsManager:
         """
         client = self._get_connected_client(mac)
         try:
-            await client.stop_notify(char_uuid)
+            await _gatt_op(
+                client.stop_notify(char_uuid), f"stop_notify {mac}/{char_uuid}"
+            )
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -273,7 +332,10 @@ class BLEConnectionsManager:
             for service in client.services:
                 for char in service.characteristics:
                     try:
-                        await client.stop_notify(char.uuid)
+                        await _gatt_op(
+                            client.stop_notify(char.uuid),
+                            f"stop_notify {mac}/{char.uuid}",
+                        )
                     except Exception:
                         pass
 
