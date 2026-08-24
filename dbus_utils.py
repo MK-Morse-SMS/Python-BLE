@@ -101,10 +101,10 @@ async def remove_device(mac: str) -> bool:
             adapter_obj = bus.get_proxy_object(BLUEZ_SERVICE, adapter_path, adapter_intro)
             adapter = adapter_obj.get_interface(ADAPTER_INTERFACE)
             await adapter.call_remove_device(path)
-            logger.warning(f"BlueZ RemoveDevice succeeded for {mac} ({path})")
+            logger.debug(f"BlueZ RemoveDevice succeeded for {mac} ({path})")
             return True
 
-        logger.info(f"RemoveDevice: no BlueZ device found for {mac}")
+        logger.debug(f"RemoveDevice: no BlueZ device found for {mac}")
         return False
     finally:
         bus.disconnect()

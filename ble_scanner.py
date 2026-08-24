@@ -3,6 +3,7 @@ import logging
 from typing import List, Dict, Optional, Callable
 
 from bleak import BleakScanner
+from bleak.exc import BleakError
 from bleak.backends.scanner import AdvertisementData
 from bleak.backends.device import BLEDevice
 from event_broadcaster import EventBroadcaster
@@ -171,7 +172,12 @@ class BLEScanner:
                     self.active_scanner = None
                 raise
             except Exception as e:
-                logger.error(f"Error in scan loop: {e}", exc_info=True)
+                # BlueZ races (e.g. "No discovery started") are routine here;
+                # only unexpected errors are worth a stack trace.
+                logger.error(
+                    f"Error in scan loop: {e}",
+                    exc_info=not isinstance(e, (BleakError, asyncio.TimeoutError)),
+                )
                 if self.active_scanner:
                     try:
                         await self.active_scanner.stop()
@@ -190,7 +196,6 @@ class BLEScanner:
         :return: BLEDevice if found, otherwise None.
         """
         device = self.devices.get(mac)
-        # If the device is not found, try to specifically find it
         if not device and self.active_scanner:
-            logger.info(f"Device {mac} found: {device is not None}")
+            logger.debug(f"Device {mac} not in scan cache yet.")
         return device

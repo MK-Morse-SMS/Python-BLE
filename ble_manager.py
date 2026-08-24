@@ -45,7 +45,7 @@ class BLEManager:
             mac in self.connections.desired_connections
             and mac not in self.connections.connected_devices
         ):
-            logger.info(f"Found desired device {mac}, connecting...")
+            logger.debug(f"Found desired device {mac}, connecting...")
             self.connections.add_device(device)
 
     async def initialize(self) -> None:

@@ -6,6 +6,7 @@ from typing import Dict, Set
 
 from bleak import BleakClient
 from bleak.backends import BleakBackend
+from bleak.exc import BleakError
 from bleak.backends.device import BLEDevice
 from dbus_utils import remove_device, reset_adapter
 from event_broadcaster import EventBroadcaster
@@ -46,6 +47,18 @@ FLAKINESS_HALF_LIFE_SECONDS = 300
 # HTTP request open indefinitely, and the backend blocked on it. Bound every
 # GATT call so a wedged operation surfaces as an error instead.
 GATT_OP_TIMEOUT_SECONDS = 10
+
+
+def _log_connect_error(mac: str, exc: BaseException) -> None:
+    """
+    Log a connect failure. Routine BLE errors (BlueZ cache misses, timeouts)
+    are fully described by their message, so only unexpected ones get a
+    traceback.
+    """
+    logger.error(
+        f"Error connecting to {mac}: {exc}",
+        exc_info=not isinstance(exc, (BleakError, asyncio.TimeoutError)),
+    )
 
 
 async def _gatt_op(coro, description: str):
@@ -211,7 +224,7 @@ class BLEConnectionsManager:
                 client.write_gatt_char(char_uuid, value, response=response),
                 f"write {mac}/{char_uuid}",
             )
-            logger.info(f"Wrote to {mac} on {char_uuid}: {value.hex()}")
+            logger.debug(f"Wrote to {mac} on {char_uuid}: {value.hex()}")
         except HTTPException:
             raise
         except Exception as e:
@@ -304,7 +317,7 @@ class BLEConnectionsManager:
             raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
-        logger.info(f"Enabled notifications for {mac} on {char_uuid}")
+        logger.debug(f"Enabled notifications for {mac} on {char_uuid}")
 
     async def disable_notification(self, mac: str, char_uuid: str) -> None:
         """
@@ -348,10 +361,10 @@ class BLEConnectionsManager:
         mac = device.address
 
         if self.recovery_lock.locked():
-            logger.info(f"Skipping {mac}: BLE recovery in progress.")
+            logger.debug(f"Skipping {mac}: BLE recovery in progress.")
             return
         if mac not in self.desired_connections:
-            logger.info(f"Skipping {mac}: not in desired connections.")
+            logger.debug(f"Skipping {mac}: not in desired connections.")
             return
         if mac in self.connected_devices:
             logger.debug(f"Skipping {mac}: already connected.")
@@ -416,7 +429,7 @@ class BLEConnectionsManager:
                             # Convert bytes to string and store it
                             device_name = device_name_bytes.decode("utf-8")
                             self.device_names[mac] = device_name
-                            logger.info(f"Read device name for {mac}: {device_name}")
+                            logger.debug(f"Read device name for {mac}: {device_name}")
                         except UnicodeDecodeError:
                             logger.warning(f"Could not decode device name for {mac}")
                 except Exception as e:
@@ -432,7 +445,7 @@ class BLEConnectionsManager:
                 await self._broadcast_connection(mac, "connected")
 
             except Exception as e:
-                logger.error(f"Error connecting to {mac}: {e}", exc_info=True)
+                _log_connect_error(mac, e)
                 self.connected_devices.pop(mac, None)
                 self.connect_times.pop(mac, None)
                 asyncio.create_task(self._register_failure(mac))
@@ -443,7 +456,7 @@ class BLEConnectionsManager:
                         self._delayed_reconnect(self.known_devices[mac])
                     )
                 else:
-                    logger.info(
+                    logger.debug(
                         f"Device {mac} is not in desired connections, not attempting to reconnect."
                     )
                 await self._broadcast_disconnection(mac)
@@ -523,7 +536,6 @@ class BLEConnectionsManager:
         async with self.recovery_lock:
             n = self.connection_failures.get(mac, 0) + 1
             self.connection_failures[mac] = n
-            logger.warning(f"BLE failure #{n} for {mac}")
 
             if n >= EXIT_THRESHOLD:
                 logger.error(
@@ -532,9 +544,7 @@ class BLEConnectionsManager:
                 )
                 os._exit(1)
             elif n >= RESET_ADAPTER_THRESHOLD:
-                logger.warning(
-                    f"Resetting BLE adapter after {n} consecutive failures for {mac}"
-                )
+                logger.warning(f"BLE failure #{n} for {mac}; resetting adapter")
                 # An adapter power-cycle invalidates every BleakClient and
                 # wipes BlueZ's view of all devices.
                 self.connected_devices.clear()
@@ -546,7 +556,7 @@ class BLEConnectionsManager:
                 else:
                     self.connection_failures.clear()
             elif n >= REMOVE_DEVICE_THRESHOLD:
-                logger.warning(f"Removing {mac} from BlueZ cache after failure #{n}")
+                logger.warning(f"BLE failure #{n} for {mac}; removing from BlueZ cache")
                 try:
                     await remove_device(mac)
                 except Exception as e:
