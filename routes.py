@@ -200,7 +200,13 @@ async def stop_scan(ble_manager: BLEManager = Depends(get_ble_manager)):
     return JSONResponse(content={"status": "scan stopped"})
 
 
-# 9. SSE endpoint to stream scan results, connection events, and notifications.
+# 10. Adapter, scanner and per-sensor connection state.
+@router.get("/health")
+async def health(ble_manager: BLEManager = Depends(get_ble_manager)):
+    return JSONResponse(content=await ble_manager.health())
+
+
+# 11. SSE endpoint to stream scan results, connection events, and notifications.
 @router.get("/events")
 async def sse_events(
     request: Request, ble_manager: BLEManager = Depends(get_ble_manager)

@@ -1,64 +1,76 @@
 import asyncio
+import contextlib
 import logging
 import os
+import re
 import time
-from typing import Dict, Set
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from bleak import BleakClient
 from bleak.backends import BleakBackend
-from bleak.exc import BleakError
-from bleak.backends.device import BLEDevice
-from dbus_utils import remove_device, reset_adapter
-from event_broadcaster import EventBroadcaster
+from bleak.exc import BleakDeviceNotFoundError, BleakError
 from fastapi import HTTPException
+
+import dbus_utils
+from event_broadcaster import EventBroadcaster
 
 logger = logging.getLogger(__name__)
 
-# Recovery tunables. A short-lived connection (connect succeeds then drops
-# within SHORT_CONNECTION_SECONDS) counts as a failure.
-#
-# On Linux kernel 6.x, BlueZ cannot connect to a device that has aged out of
-# its cache, even while an active scan is running (bleak #1244) — the connect
-# fails with TimeoutError or "device '...' not found". The reliable fix is to
-# RemoveDevice from BlueZ's cache, forcing a fresh re-discovery on the next
-# advertisement. Because that's the *common* cause on our edge kernel (not a
-# rare wedge), we remove on the very first failure rather than waiting for a
-# streak to build up.
-SHORT_CONNECTION_SECONDS = 15
-REMOVE_DEVICE_THRESHOLD = 1
-RESET_ADAPTER_THRESHOLD = 6
-EXIT_THRESHOLD = 10
+# bleak's connect timeout covers the link *and* service discovery. Sensors ask
+# for a 300-330 ms connection interval as soon as they connect, so discovering
+# an uncached GATT database can run well past bleak's 10 s default.
+CONNECT_TIMEOUT_SECONDS = 25
+# Bounds the whole connect() call. bleak's own timeout does not cover its
+# cleanup, which awaits a BlueZ Disconnect reply that may never come.
+CONNECT_HARD_TIMEOUT_SECONDS = CONNECT_TIMEOUT_SECONDS + 10
 
-# Reconnect-backoff tunables. Connects are serialized through a single lock,
-# so a flaky sensor that keeps dropping can monopolise the slot and starve
-# healthy ones. Each failure event bumps a per-device flakiness score; the
-# reconnect delay grows exponentially with that score (base * 2**score),
-# capped at RECONNECT_MAX_SECONDS. The score decays with wall-clock time
-# (halving every FLAKINESS_HALF_LIFE_SECONDS), so a device that recovers
-# drifts back to the base delay on its own — no explicit reset needed.
+# A connection that drops sooner than this counts as a failed connect.
+SHORT_CONNECTION_SECONDS = 15
+
+# Per-sensor recovery, driven by consecutive failures (timeouts, errors,
+# short-lived connections). A sensor BlueZ has no object for is not a failure:
+# no connect attempt can fix that, only a fresh advertisement can. RemoveDevice
+# also discards BlueZ's GATT cache, forcing a full discovery on the next
+# connect, so it is not done on every failure.
+REMOVE_DEVICE_EVERY = 3
+QUARANTINE_EVERY = 6
+QUARANTINE_SECONDS = 300
+
+# Reconnect backoff: base * 2**flakiness, capped. Flakiness rises by one per
+# failure and halves every half-life, so a recovered sensor drifts back to the
+# base delay on its own.
 RECONNECT_BASE_SECONDS = 5
 RECONNECT_MAX_SECONDS = 60
 FLAKINESS_HALF_LIFE_SECONDS = 300
 
+# Power-cycling the adapter drops every sensor, so it happens only when nothing
+# has been connected for ADAPTER_STALL_SECONDS despite ADAPTER_STALL_MIN_FAILURES
+# failed attempts, and never more often than ADAPTER_RESET_MIN_INTERVAL_SECONDS.
+# If EXIT_AFTER_FAILED_RESETS resets in a row bring nothing back, exit so Balena
+# restarts the container.
+ADAPTER_STALL_SECONDS = 600
+ADAPTER_STALL_MIN_FAILURES = 6
+ADAPTER_RESET_MIN_INTERVAL_SECONDS = 900
+EXIT_AFTER_FAILED_RESETS = 2
+
+# A wanted sensor missing from BlueZ this long gets a fresh scan session, which
+# is what gets it rediscovered. The interval doubles while nothing turns up;
+# past the cap the scanner's regular cycle takes over.
+REDISCOVERY_RESTART_SECONDS = 60
+REDISCOVERY_RESTART_MAX_SECONDS = 240
+
 # Every GATT operation is a D-Bus round-trip to BlueZ, and BlueZ does not always
 # reply. If the device disconnects mid-call — or the device object is removed
-# from BlueZ's cache while a call is in flight, which is exactly what our own
-# recovery path does on failure — the await can hang forever. That leaves the
-# HTTP request open indefinitely, and the backend blocked on it. Bound every
-# GATT call so a wedged operation surfaces as an error instead.
+# from BlueZ's cache while a call is in flight — the await can hang forever.
+# That leaves the HTTP request open indefinitely, and the backend blocked on it.
+# Bound every GATT call so a wedged operation surfaces as an error instead.
 GATT_OP_TIMEOUT_SECONDS = 10
+DBUS_OP_TIMEOUT_SECONDS = 15
+SUPERVISOR_TICK_SECONDS = 1.0
 
-
-def _log_connect_error(mac: str, exc: BaseException) -> None:
-    """
-    Log a connect failure. Routine BLE errors (BlueZ cache misses, timeouts)
-    are fully described by their message, so only unexpected ones get a
-    traceback.
-    """
-    logger.error(
-        f"Error connecting to {mac}: {exc}",
-        exc_info=not isinstance(exc, (BleakError, asyncio.TimeoutError)),
-    )
+_DEVICE_NOT_FOUND = re.compile(r"device '[^']*' not found")
 
 
 async def _gatt_op(coro, description: str):
@@ -81,76 +93,144 @@ async def _gatt_op(coro, description: str):
         )
 
 
+def _classify_failure(exc: BaseException, link_up: bool) -> str:
+    """Name the kind of connect failure, for counters, logs and /health."""
+    if isinstance(exc, BleakDeviceNotFoundError) or (
+        isinstance(exc, BleakError) and _DEVICE_NOT_FOUND.search(str(exc))
+    ):
+        return "not_in_bluez"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout_link_up" if link_up else "timeout"
+    return "dropped_during_connect" if link_up else "error"
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    return f"{seconds / 60:.0f} min"
+
+
+@dataclass
+class DeviceState:
+    """Everything pyble tracks about one sensor."""
+
+    mac: str
+    client: Optional[BleakClient] = None
+    connected_at: Optional[float] = None
+    connecting: bool = False
+    next_attempt_at: float = 0.0
+    last_attempt_started: float = 0.0
+    # Set while BlueZ has no object for the sensor; cleared when it reappears.
+    missing_since: Optional[float] = None
+    pending_remove: bool = False
+    consecutive_failures: int = 0
+    flakiness: float = 0.0
+    flakiness_updated: float = 0.0
+    last_seen: Optional[float] = None
+    rssi: Optional[int] = None
+    adv_name: Optional[str] = None
+    attempts: int = 0
+    connects: int = 0
+    drops: int = 0
+    missing_events: int = 0
+    failures: Counter = field(default_factory=Counter)
+    last_error: Optional[str] = None
+    last_attempt: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class _Attempt:
+    link_up: bool = False
+
+
 class BLEConnectionsManager:
     """
-    Manages and maintains active BLE connections. It handles:
-      - Desired connection set
-      - On-demand connections to devices
-      - Reading/writing/notifications for connected devices
+    Keeps the desired set of sensors connected, and serves GATT operations on
+    them.
+
+    One supervisor task makes every connect attempt and runs every recovery
+    step, one at a time, under ``radio_lock`` (shared with the scanner's
+    session restarts). Advertisements and drops only update per-sensor state
+    and wake the supervisor, so backoff is authoritative and a retry can be
+    neither lost nor duplicated.
     """
 
-    def __init__(self, event_broadcaster: EventBroadcaster) -> None:
+    def __init__(
+        self,
+        event_broadcaster: EventBroadcaster,
+        radio_lock: Optional[asyncio.Lock] = None,
+        bluez: Any = dbus_utils,
+        client_factory: Callable[..., BleakClient] = BleakClient,
+    ) -> None:
         """
         :param event_broadcaster: The broadcaster for SSE or similar event flow.
+        :param radio_lock: Lock serializing connects, recovery and scan restarts.
+        :param bluez: BlueZ operations (``dbus_utils``; replaceable in tests).
+        :param client_factory: BleakClient or a stand-in with the same signature.
         """
         self.event_broadcaster = event_broadcaster
+        self.radio_lock = radio_lock or asyncio.Lock()
+        self._bluez = bluez
+        self._client_factory = client_factory
 
         # The set of MAC addresses we want to keep connected
         self.desired_connections: Set[str] = set()
-
-        # Current connected device clients
-        self.connected_devices: Dict[str, BleakClient] = {}
-
-        # Lock to prevent race conditions when scanning and connecting
-        self.connection_lock = asyncio.Lock()
-
-        # Store device names separately from the BleakClient objects
+        self.devices: Dict[str, DeviceState] = {}
         self.device_names: Dict[str, str] = {}
 
-        # Store devices keyed by MAC
-        self.known_devices: Dict[str, BLEDevice] = {}
+        # Wired up by BLEManager to the scanner.
+        self.request_scan_restart: Callable[[str], None] = lambda reason: None
+        self.scan_session_age: Callable[[], Optional[float]] = lambda: None
+        self.scan_ready_for_connects: Callable[[], bool] = lambda: True
 
-        # Per-MAC consecutive failure count, driving the recovery escalation
-        # ladder (see _register_failure).
-        self.connection_failures: Dict[str, int] = {}
+        self._wake = asyncio.Event()
+        self._supervisor: Optional[asyncio.Task] = None
 
-        # Per-MAC monotonic timestamp of the most recent successful connect.
-        # Used to classify short-lived drops (< SHORT_CONNECTION_SECONDS) as
-        # failures and long-lived drops as benign.
-        self.connect_times: Dict[str, float] = {}
+        self._last_healthy = time.monotonic()
+        self._stall_failures = 0
+        self._last_reset_at: Optional[float] = None
+        self._resets_since_success = 0
+        self.reset_count = 0
+        self.last_reset_reason: Optional[str] = None
+        self._last_rediscovery_restart: Optional[float] = None
+        self._rediscovery_interval = REDISCOVERY_RESTART_SECONDS
 
-        # Per-MAC flakiness score and the monotonic time it was last updated.
-        # Distinct from connection_failures (which drives the recovery ladder
-        # and gets reset by recovery steps): this score is never reset by
-        # recovery, only decayed with time, so it reflects a device's *recent*
-        # reliability and feeds the reconnect backoff that deprioritises flaky
-        # sensors without permanently starving them.
-        self.flakiness: Dict[str, float] = {}
-        self.flakiness_updated: Dict[str, float] = {}
+    # --- Lifecycle -----------------------------------------------------------
 
-        # Held while a recovery step (RemoveDevice / adapter power-cycle) is
-        # in flight. Prevents concurrent recoveries and pauses new connect
-        # attempts so we don't race with BlueZ state being torn down.
-        self.recovery_lock = asyncio.Lock()
+    def start(self) -> None:
+        """Start the supervisor. Requires a running event loop."""
+        if self._supervisor is None or self._supervisor.done():
+            self._supervisor = asyncio.create_task(self._supervise(), name="ble-supervisor")
 
-    def add_device(self, device: BLEDevice) -> None:
-        """
-        Add a device to desired connections and connect if not already connected.
+    async def stop(self) -> None:
+        """Stop the supervisor; existing connections are left alone."""
+        if self._supervisor is not None:
+            self._supervisor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._supervisor
+            self._supervisor = None
 
-        :param device: BLEDevice instance. We'll use device.address as the key.
-        """
-        mac = device.address
+    # --- Inputs --------------------------------------------------------------
 
-        # Store device in known devices
-        self.known_devices[mac] = device
+    def desire(self, mac: str) -> None:
+        """Add ``mac`` to the set of sensors to keep connected."""
+        mac = mac.upper()
+        self.desired_connections.add(mac)
+        self.devices.setdefault(mac, DeviceState(mac))
+        self._wake.set()
 
-        # If this is a desired connection and not already connected, connect now
-        if mac not in self.desired_connections:
-            self.desired_connections.add(mac)
-
-        if mac not in self.connected_devices and mac in self.desired_connections:
-            # Start a task to connect to the device
-            asyncio.create_task(self._connect_to_device(device))
+    def on_advertisement(self, device, rssi: Optional[int]) -> None:
+        """Record an advertisement from the scanner. Ignores unwanted devices."""
+        st = self.devices.get(device.address.upper())
+        if st is None:
+            return
+        st.last_seen = time.monotonic()
+        if rssi is not None:
+            st.rssi = rssi
+        if device.name:
+            st.adv_name = device.name
+        if st.client is None:
+            self._wake.set()
 
     async def disconnect_device(self, mac: str) -> None:
         """
@@ -158,33 +238,30 @@ class BLEConnectionsManager:
 
         :param mac: The MAC address of the target device.
         """
-        if mac in self.desired_connections:
-            self.desired_connections.remove(mac)
+        mac = mac.upper()
+        self.desired_connections.discard(mac)
+        st = self.devices.get(mac)
+        if st is None or st.client is None:
+            return
 
-        # If the device is connected, disconnect it
-        if mac in self.connected_devices:
-            client = self.connected_devices.pop(mac)
-            try:
-                # Bounded: a disconnect that never returns would otherwise hang
-                # the request. The client is already dropped from
-                # connected_devices, so treat a timeout like any other failure
-                # and carry on to the broadcast.
-                await asyncio.wait_for(
-                    client.disconnect(), timeout=GATT_OP_TIMEOUT_SECONDS
-                )
-            except Exception as e:
-                logger.debug(f"Error disconnecting {mac}: {e}")
-            await self._broadcast_disconnection(mac)
+        client, st.client, st.connected_at = st.client, None, None
+        try:
+            # Bounded: a disconnect that never returns would otherwise hang
+            # the request.
+            await asyncio.wait_for(client.disconnect(), timeout=GATT_OP_TIMEOUT_SECONDS)
+        except Exception as e:
+            logger.debug(f"Error disconnecting {mac}: {e}")
+        self._publish_connection(mac, "disconnected")
 
     async def disconnect_all(self) -> None:
         """
         Disconnect all devices that are currently in the desired connections.
         """
-        disconnect_tasks = [
-            self.disconnect_device(mac) for mac in list(self.desired_connections)
-        ]
-        if disconnect_tasks:
-            await asyncio.gather(*disconnect_tasks)
+        await asyncio.gather(
+            *(self.disconnect_device(mac) for mac in list(self.desired_connections))
+        )
+
+    # --- GATT operations -----------------------------------------------------
 
     async def read_characteristic(self, mac: str, char_uuid: str) -> str:
         """
@@ -282,6 +359,7 @@ class BLEConnectionsManager:
         :raises HTTPException: If device not connected
         """
         client = self._get_connected_client(mac)
+        mac = mac.upper()
 
         # Try disabling notifications first to avoid potential issues
         try:
@@ -297,15 +375,13 @@ class BLEConnectionsManager:
             pass
 
         def notification_handler(sender, data):
-            asyncio.create_task(
-                self.event_broadcaster.broadcast(
-                    {
-                        "type": "notification",
-                        "bdaddr": mac,
-                        "characteristic": char_uuid,
-                        "data": data.hex(),
-                    }
-                )
+            self.event_broadcaster.publish(
+                {
+                    "type": "notification",
+                    "bdaddr": mac,
+                    "characteristic": char_uuid,
+                    "data": data.hex(),
+                }
             )
 
         try:
@@ -341,259 +417,421 @@ class BLEConnectionsManager:
         """
         Disable all notifications on all connected devices.
         """
-        for mac, client in list(self.connected_devices.items()):
+        for st in list(self.devices.values()):
+            client = st.client
+            if client is None:
+                continue
             for service in client.services:
                 for char in service.characteristics:
                     try:
                         await _gatt_op(
                             client.stop_notify(char.uuid),
-                            f"stop_notify {mac}/{char.uuid}",
+                            f"stop_notify {st.mac}/{char.uuid}",
                         )
                     except Exception:
                         pass
-
-    async def _connect_to_device(self, device: BLEDevice) -> None:
-        """
-        Connect to a specific BLE device.
-
-        :param device: The BLE device to connect to.
-        """
-        mac = device.address
-
-        if self.recovery_lock.locked():
-            logger.debug(f"Skipping {mac}: BLE recovery in progress.")
-            return
-        if mac not in self.desired_connections:
-            logger.debug(f"Skipping {mac}: not in desired connections.")
-            return
-        if mac in self.connected_devices:
-            logger.debug(f"Skipping {mac}: already connected.")
-            return
-        if self.connection_lock.locked():
-            logger.debug(f"Skipping {mac}: another connect attempt in progress.")
-            return
-        logger.debug(f"Attempting to connect to {mac}...")
-
-        async with self.connection_lock:
-            # Skip if this device is already connected
-            if mac in self.connected_devices:
-                return
-
-            def _disconnection_handler(_client):
-                logger.warning(f"Connection to {mac} dropped.")
-                self.connected_devices.pop(mac, None)
-                connect_time = self.connect_times.pop(mac, None)
-                # Broadcast disconnection asynchronously
-                asyncio.create_task(self._broadcast_disconnection(mac))
-
-                # A drop within SHORT_CONNECTION_SECONDS of a successful
-                # connect is the BlueZ-wedge signature; a longer-lived
-                # connection ending is normal and resets the counter.
-                if connect_time is not None:
-                    uptime = time.monotonic() - connect_time
-                    if uptime < SHORT_CONNECTION_SECONDS:
-                        asyncio.create_task(self._register_failure(mac))
-                    else:
-                        self.connection_failures.pop(mac, None)
-
-                # Attempt to reconnect if still desired
-                if mac in self.desired_connections and mac in self.known_devices:
-                    # Add a small delay before reconnection attempt
-                    asyncio.create_task(
-                        self._delayed_reconnect(self.known_devices[mac])
-                    )
-
-            try:
-
-                # Attempt to connect
-                client = BleakClient(
-                    device, disconnected_callback=_disconnection_handler, timeout=10.0
-                )
-                logger.debug(f"Connecting to {mac}...")
-                await client.connect()
-                self.connected_devices[mac] = client
-
-                # Try to read the device name characteristic (0x2A00)
-                try:
-                    # First save the advertised name as fallback
-                    if device.name:
-                        self.device_names[mac] = device.name
-
-                    # Now try to read the actual characteristic
-                    # 0x2A00 is the Device Name characteristic in Generic Access service
-                    device_name_bytes = await client.read_gatt_char(
-                        "00002a00-0000-1000-8000-00805f9b34fb"
-                    )
-                    if device_name_bytes:
-                        try:
-                            # Convert bytes to string and store it
-                            device_name = device_name_bytes.decode("utf-8")
-                            self.device_names[mac] = device_name
-                            logger.debug(f"Read device name for {mac}: {device_name}")
-                        except UnicodeDecodeError:
-                            logger.warning(f"Could not decode device name for {mac}")
-                except Exception as e:
-                    logger.debug(
-                        f"Could not read device name characteristic for {mac}: {e}"
-                    )
-                    # Use advertised name or address as fallback if we couldn't read the name
-                    if mac not in self.device_names:
-                        self.device_names[mac] = device.name or mac
-
-                self.connect_times[mac] = time.monotonic()
-                logger.info(f"Successfully connected to {mac}.")
-                await self._broadcast_connection(mac, "connected")
-
-            except Exception as e:
-                _log_connect_error(mac, e)
-                self.connected_devices.pop(mac, None)
-                self.connect_times.pop(mac, None)
-                asyncio.create_task(self._register_failure(mac))
-                # Attempt to reconnect if desired
-                if mac in self.desired_connections and mac in self.known_devices:
-                    # Add a small delay before reconnection attempt
-                    asyncio.create_task(
-                        self._delayed_reconnect(self.known_devices[mac])
-                    )
-                else:
-                    logger.debug(
-                        f"Device {mac} is not in desired connections, not attempting to reconnect."
-                    )
-                await self._broadcast_disconnection(mac)
-
-    async def _delayed_reconnect(self, device: BLEDevice) -> None:
-        """
-        Wait before attempting to reconnect to avoid rapid reconnection attempts.
-        The wait scales with the device's flakiness so flaky sensors back off
-        and stop starving healthy ones of the single connection slot.
-
-        :param device: The device to reconnect to.
-        """
-        delay = self._reconnect_delay(device.address)
-        await asyncio.sleep(delay)
-        if device.address in self.desired_connections:
-            await self._connect_to_device(device)
-
-    def _current_flakiness(self, mac: str) -> float:
-        """
-        Return ``mac``'s flakiness score decayed to the present moment. The
-        score halves every FLAKINESS_HALF_LIFE_SECONDS, so a device that stops
-        failing drifts back toward zero on its own.
-        """
-        score = self.flakiness.get(mac, 0.0)
-        if score <= 0.0:
-            return 0.0
-        elapsed = time.monotonic() - self.flakiness_updated.get(mac, 0.0)
-        return score * (0.5 ** (elapsed / FLAKINESS_HALF_LIFE_SECONDS))
-
-    def _bump_flakiness(self, mac: str) -> float:
-        """
-        Increment ``mac``'s decayed flakiness score by one and stamp it now.
-        Called on every connect failure / short-lived drop.
-        """
-        score = self._current_flakiness(mac) + 1.0
-        self.flakiness[mac] = score
-        self.flakiness_updated[mac] = time.monotonic()
-        return score
-
-    def _reconnect_delay(self, mac: str) -> float:
-        """
-        Reconnect backoff for ``mac``: RECONNECT_BASE_SECONDS for a healthy
-        device, growing exponentially with its flakiness score and capped at
-        RECONNECT_MAX_SECONDS.
-        """
-        delay = RECONNECT_BASE_SECONDS * (2 ** self._current_flakiness(mac))
-        return min(delay, RECONNECT_MAX_SECONDS)
-
-    async def _register_failure(self, mac: str) -> None:
-        """
-        Record a connect failure (or short-lived drop) for ``mac`` and run the
-        recovery escalation ladder when thresholds are crossed:
-
-          * REMOVE_DEVICE_THRESHOLD — clear this device from BlueZ's cache
-          * RESET_ADAPTER_THRESHOLD — power-cycle the BLE adapter
-          * EXIT_THRESHOLD          — os._exit(1) so Balena restarts the container
-
-        All state mutation and recovery actions run under ``recovery_lock``
-        so concurrent failures serialize cleanly — increments aren't lost and
-        only one recovery runs at a time. The counter climbs with every failure
-        and escalates up the rungs; it is reset only by an adapter-reset success
-        (clears all counters) or by a healthy long-lived connection later
-        dropping (see ``_disconnection_handler``). RemoveDevice runs on every
-        failure (it's the kernel-6.x cache-aging fix, threshold == 1) and
-        deliberately does NOT reset the counter — otherwise a device stuck at
-        "remove, retry, fail" would peg the counter at 1 and never escalate to
-        the adapter reset / exit rungs.
-
-        This is also the single funnel for every connect failure / short-lived
-        drop, so it's where we bump the per-device flakiness score that drives
-        reconnect backoff.
-        """
-        # Bump flakiness regardless of recovery state; the reconnect backoff
-        # reads this to deprioritise this device relative to healthy ones.
-        self._bump_flakiness(mac)
-
-        async with self.recovery_lock:
-            n = self.connection_failures.get(mac, 0) + 1
-            self.connection_failures[mac] = n
-
-            if n >= EXIT_THRESHOLD:
-                logger.error(
-                    f"BLE wedged after {n} consecutive failures for {mac}; "
-                    f"exiting for container restart"
-                )
-                os._exit(1)
-            elif n >= RESET_ADAPTER_THRESHOLD:
-                logger.warning(f"BLE failure #{n} for {mac}; resetting adapter")
-                # An adapter power-cycle invalidates every BleakClient and
-                # wipes BlueZ's view of all devices.
-                self.connected_devices.clear()
-                self.connect_times.clear()
-                try:
-                    await reset_adapter()
-                except Exception as e:
-                    logger.error(f"reset_adapter failed: {e}", exc_info=True)
-                else:
-                    self.connection_failures.clear()
-            elif n >= REMOVE_DEVICE_THRESHOLD:
-                logger.warning(f"BLE failure #{n} for {mac}; removing from BlueZ cache")
-                try:
-                    await remove_device(mac)
-                except Exception as e:
-                    logger.error(f"remove_device({mac}) failed: {e}", exc_info=True)
-                # Intentionally do NOT reset connection_failures here: with
-                # REMOVE_DEVICE_THRESHOLD == 1 every failure removes the device,
-                # and resetting would peg the counter at 1, making the
-                # adapter-reset / exit rungs above unreachable. Let it climb.
-
-    def _get_connected_client(self, mac: str) -> BleakClient:
-        """
-        Retrieve a connected BleakClient or raise HTTPException if not connected.
-        """
-        if mac not in self.connected_devices:
-            raise HTTPException(status_code=404, detail="Device not connected")
-        return self.connected_devices[mac]
-
-    async def _broadcast_connection(self, mac: str, status: str) -> None:
-        """
-        Helper to broadcast a connection-status event.
-        """
-        await self.event_broadcaster.broadcast(
-            {"type": "connection", "bdaddr": mac, "status": status}
-        )
-
-    async def _broadcast_disconnection(self, mac: str) -> None:
-        """
-        Helper to broadcast a disconnection event.
-        """
-        await self._broadcast_connection(mac, "disconnected")
 
     async def get_connected_devices(self) -> Dict[str, str]:
         """
         Return a dictionary of connected devices (MAC: name).
         """
         return {
-            mac: name
-            for mac, name in self.device_names.items()
-            if mac in self.connected_devices
+            mac: self.device_names.get(mac, mac)
+            for mac, st in self.devices.items()
+            if st.client is not None
+        }
+
+    def _get_connected_client(self, mac: str) -> BleakClient:
+        """
+        Retrieve a connected BleakClient or raise HTTPException if not connected.
+        """
+        st = self.devices.get(mac.upper())
+        if st is None or st.client is None:
+            raise HTTPException(status_code=404, detail="Device not connected")
+        return st.client
+
+    # --- Supervisor ----------------------------------------------------------
+
+    async def _supervise(self) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(self._wake.wait(), SUPERVISOR_TICK_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            self._wake.clear()
+            try:
+                await self._tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("BLE supervisor tick failed")
+                await asyncio.sleep(SUPERVISOR_TICK_SECONDS)
+
+    async def _tick(self) -> None:
+        now = time.monotonic()
+        wanted = [self.devices[mac] for mac in sorted(self.desired_connections)]
+
+        if any(st.client is not None for st in wanted):
+            self._last_healthy = now
+            self._stall_failures = 0
+        for st in wanted:
+            if (
+                st.client is not None
+                and st.consecutive_failures
+                and now - st.connected_at >= SHORT_CONNECTION_SECONDS
+            ):
+                st.consecutive_failures = 0
+
+        for st in wanted:
+            if st.pending_remove:
+                async with self.radio_lock:
+                    await self._remove_from_bluez(st)
+
+        if self._adapter_stalled(now):
+            await self._recover_adapter(now)
+            return
+
+        await self._refresh_missing(wanted)
+        self._maybe_restart_scan_for_missing(wanted, time.monotonic())
+
+        # Kernel 6.x BlueZ can't connect without discovery running.
+        if not self.scan_ready_for_connects():
+            return
+        st = self._next_candidate(wanted, time.monotonic())
+        if st is not None:
+            async with self.radio_lock:
+                await self._attempt(st)
+            # Another sensor may be waiting; don't sit out the tick.
+            self._wake.set()
+
+    def _next_candidate(self, wanted: List[DeviceState], now: float) -> Optional[DeviceState]:
+        candidates = [
+            st
+            for st in wanted
+            if st.client is None
+            and not st.connecting
+            and st.missing_since is None
+            and now >= st.next_attempt_at
+        ]
+        # Least recently tried first, so one sensor can't hog the radio.
+        return min(candidates, key=lambda st: st.last_attempt_started, default=None)
+
+    async def _attempt(self, st: DeviceState) -> None:
+        mac = st.mac
+        try:
+            device = await self._bluez.bluez_device(mac)
+        except Exception as e:
+            error = str(e) or type(e).__name__
+            self._record_failure(st, "bluez_error", error)
+            logger.warning(f"Connect to {mac} skipped: BlueZ unavailable ({error})")
+            return
+        if device is None:
+            self._mark_missing(st, "no BlueZ object")
+            return
+
+        attempt = _Attempt()
+        client: Optional[BleakClient] = None
+
+        def on_disconnect(_client: BleakClient) -> None:
+            self._on_disconnect(st, client, attempt)
+
+        client = self._client_factory(
+            device, disconnected_callback=on_disconnect, timeout=CONNECT_TIMEOUT_SECONDS
+        )
+        st.connecting = True
+        st.attempts += 1
+        started = st.last_attempt_started = time.monotonic()
+        context = self._seen_context(st, started)
+        try:
+            await asyncio.wait_for(client.connect(), CONNECT_HARD_TIMEOUT_SECONDS)
+        except Exception as e:
+            duration = time.monotonic() - started
+            kind = _classify_failure(e, attempt.link_up)
+            error = str(e) or type(e).__name__
+            st.last_attempt = {"outcome": kind, "duration_s": round(duration, 1), "error": error}
+            if kind == "not_in_bluez":
+                self._mark_missing(st, error)
+                return
+            self._record_failure(st, kind, error)
+            phase = "after link up" if attempt.link_up else "before link up"
+            logger.warning(
+                f"Connect to {mac} failed after {duration:.1f}s {phase}: {error} "
+                f"({context}; {st.consecutive_failures} in a row)"
+            )
+            return
+        finally:
+            st.connecting = False
+
+        duration = time.monotonic() - started
+        if mac not in self.desired_connections:
+            # Disconnect was requested while connecting.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(client.disconnect(), GATT_OP_TIMEOUT_SECONDS)
+            return
+
+        now = time.monotonic()
+        st.client = client
+        st.connected_at = now
+        st.connects += 1
+        st.last_error = None
+        st.last_attempt = {"outcome": "connected", "duration_s": round(duration, 1)}
+        self._last_healthy = now
+        self._stall_failures = 0
+        self._resets_since_success = 0
+        # BlueZ's Name comes from the advertisement or the GAP read it does on
+        # connect, so there's no need for a GATT read of our own here.
+        self.device_names[mac] = device.name or st.adv_name or mac
+        logger.info(f"Connected to {mac} in {duration:.1f}s ({context})")
+        self._publish_connection(mac, "connected")
+
+    def _on_disconnect(
+        self, st: DeviceState, client: Optional[BleakClient], attempt: _Attempt
+    ) -> None:
+        """bleak's disconnected callback for ``client``."""
+        if st.client is not client:
+            # Either the link dropped mid-connect (the attempt handles it), or
+            # we already let go of this client (deliberate disconnect, reset).
+            if st.connecting:
+                attempt.link_up = True
+            return
+
+        mac = st.mac
+        now = time.monotonic()
+        uptime = now - (st.connected_at or now)
+        st.client = None
+        st.connected_at = None
+        st.drops += 1
+        self._publish_connection(mac, "disconnected")
+        if mac not in self.desired_connections:
+            return
+
+        if uptime < SHORT_CONNECTION_SECONDS:
+            self._record_failure(st, "short_connection", f"dropped after {uptime:.1f}s")
+            logger.warning(
+                f"Connection to {mac} dropped after {uptime:.1f}s; counting it as a "
+                f"failed connect ({st.consecutive_failures} in a row)"
+            )
+        else:
+            st.consecutive_failures = 0
+            st.next_attempt_at = now + self._reconnect_delay(st, now)
+            logger.warning(f"Connection to {mac} dropped after {_fmt_duration(uptime)}")
+        self._wake.set()
+
+    # --- Per-sensor recovery -------------------------------------------------
+
+    def _record_failure(self, st: DeviceState, kind: str, error: str) -> None:
+        now = time.monotonic()
+        st.failures[kind] += 1
+        st.consecutive_failures += 1
+        st.last_error = error
+        self._stall_failures += 1
+        self._bump_flakiness(st, now)
+
+        delay = self._reconnect_delay(st, now)
+        n = st.consecutive_failures
+        if n % QUARANTINE_EVERY == 0:
+            delay = max(delay, QUARANTINE_SECONDS)
+            logger.warning(
+                f"{st.mac}: {n} failed connects in a row; next try in {_fmt_duration(delay)}"
+            )
+        if n % REMOVE_DEVICE_EVERY == 0:
+            st.pending_remove = True
+        st.next_attempt_at = now + delay
+
+    def _mark_missing(self, st: DeviceState, why: str) -> None:
+        if st.missing_since is None:
+            st.missing_since = time.monotonic()
+            st.missing_events += 1
+            logger.info(f"{st.mac} is not in BlueZ ({why}); waiting for it to advertise")
+
+    async def _refresh_missing(self, wanted: List[DeviceState]) -> None:
+        for st in wanted:
+            if st.missing_since is None or st.client is not None:
+                continue
+            try:
+                device = await self._bluez.bluez_device(st.mac)
+            except Exception as e:
+                logger.debug(f"BlueZ lookup for {st.mac} failed: {e}")
+                continue
+            if device is None:
+                continue
+            logger.info(
+                f"{st.mac} is back in BlueZ after "
+                f"{_fmt_duration(time.monotonic() - st.missing_since)}"
+            )
+            st.missing_since = None
+            self._rediscovery_interval = REDISCOVERY_RESTART_SECONDS
+            self._last_rediscovery_restart = None
+
+    def _maybe_restart_scan_for_missing(self, wanted: List[DeviceState], now: float) -> None:
+        overdue = [
+            st.mac
+            for st in wanted
+            if st.client is None
+            and st.missing_since is not None
+            and now - st.missing_since >= REDISCOVERY_RESTART_SECONDS
+        ]
+        if not overdue or self._rediscovery_interval > REDISCOVERY_RESTART_MAX_SECONDS:
+            return
+        session_age = self.scan_session_age()
+        if session_age is None or session_age < self._rediscovery_interval:
+            return
+        if (
+            self._last_rediscovery_restart is not None
+            and now - self._last_rediscovery_restart < self._rediscovery_interval
+        ):
+            return
+        logger.info(
+            f"{', '.join(overdue)} still missing after a "
+            f"{_fmt_duration(session_age)} scan session; restarting the scan"
+        )
+        self._last_rediscovery_restart = now
+        self._rediscovery_interval *= 2
+        self.request_scan_restart("rediscover missing sensors")
+
+    async def _remove_from_bluez(self, st: DeviceState) -> None:
+        st.pending_remove = False
+        if st.client is not None:
+            return
+        logger.warning(
+            f"Removing {st.mac} from BlueZ after {st.consecutive_failures} failed connects in a row"
+        )
+        try:
+            await asyncio.wait_for(self._bluez.remove_device(st.mac), DBUS_OP_TIMEOUT_SECONDS)
+        except Exception as e:
+            logger.error(f"RemoveDevice({st.mac}) failed: {e}")
+            return
+        self._mark_missing(st, "removed")
+        self.request_scan_restart("rediscover after RemoveDevice")
+
+    def _current_flakiness(self, st: DeviceState, now: float) -> float:
+        if st.flakiness <= 0.0:
+            return 0.0
+        elapsed = now - st.flakiness_updated
+        return st.flakiness * (0.5 ** (elapsed / FLAKINESS_HALF_LIFE_SECONDS))
+
+    def _bump_flakiness(self, st: DeviceState, now: float) -> None:
+        st.flakiness = self._current_flakiness(st, now) + 1.0
+        st.flakiness_updated = now
+
+    def _reconnect_delay(self, st: DeviceState, now: float) -> float:
+        delay = RECONNECT_BASE_SECONDS * (2 ** self._current_flakiness(st, now))
+        return min(delay, RECONNECT_MAX_SECONDS)
+
+    # --- Adapter-wide recovery -----------------------------------------------
+
+    def _adapter_stalled(self, now: float) -> bool:
+        if not self.desired_connections:
+            return False
+        if any(self.devices[mac].client is not None for mac in self.desired_connections):
+            return False
+        if now - self._last_healthy < ADAPTER_STALL_SECONDS:
+            return False
+        if self._stall_failures < ADAPTER_STALL_MIN_FAILURES:
+            return False
+        return (
+            self._last_reset_at is None
+            or now - self._last_reset_at >= ADAPTER_RESET_MIN_INTERVAL_SECONDS
+        )
+
+    async def _recover_adapter(self, now: float) -> None:
+        reason = (
+            f"no sensor connected for {_fmt_duration(now - self._last_healthy)} "
+            f"with {self._stall_failures} failed connects"
+        )
+        if self._resets_since_success >= EXIT_AFTER_FAILED_RESETS:
+            logger.error(
+                f"BLE still stalled after {self._resets_since_success} adapter resets "
+                f"({reason}); exiting for container restart"
+            )
+            os._exit(1)
+        async with self.radio_lock:
+            await self._reset_adapter(reason)
+
+    async def _reset_adapter(self, reason: str) -> None:
+        self.reset_count += 1
+        self._resets_since_success += 1
+        self.last_reset_reason = reason
+        logger.warning(f"Resetting BLE adapter: {reason}")
+
+        # A power-cycle invalidates every BleakClient. Let go of them first so
+        # their disconnect callbacks don't count as failures.
+        for st in self.devices.values():
+            if st.client is not None:
+                st.client = None
+                st.connected_at = None
+                self._publish_connection(st.mac, "disconnected")
+            st.consecutive_failures = 0
+            st.pending_remove = False
+            st.next_attempt_at = 0.0
+        try:
+            await asyncio.wait_for(self._bluez.reset_adapter(), DBUS_OP_TIMEOUT_SECONDS * 2)
+        except Exception as e:
+            logger.error(f"Adapter reset failed: {e}")
+
+        now = time.monotonic()
+        self._last_reset_at = now
+        self._last_healthy = now
+        self._stall_failures = 0
+        # The power-cycle ended BlueZ discovery under the scanner.
+        self.request_scan_restart("adapter reset")
+
+    # --- Reporting -----------------------------------------------------------
+
+    def _seen_context(self, st: DeviceState, now: float) -> str:
+        parts = [
+            f"seen {now - st.last_seen:.0f}s ago" if st.last_seen is not None else "not seen advertising yet"
+        ]
+        if st.rssi is not None:
+            parts.append(f"rssi {st.rssi}")
+        return ", ".join(parts)
+
+    def _publish_connection(self, mac: str, status: str) -> None:
+        self.event_broadcaster.publish({"type": "connection", "bdaddr": mac, "status": status})
+
+    def health(self) -> Dict[str, Any]:
+        """Per-sensor and adapter-recovery state, for /health."""
+        now = time.monotonic()
+
+        def ago(t: Optional[float]) -> Optional[float]:
+            return None if t is None else round(now - t, 1)
+
+        devices = {}
+        for mac, st in sorted(self.devices.items()):
+            devices[mac] = {
+                "desired": mac in self.desired_connections,
+                "connected": st.client is not None,
+                "connected_for_s": ago(st.connected_at),
+                "connecting": st.connecting,
+                "missing_for_s": ago(st.missing_since),
+                "last_seen_s_ago": ago(st.last_seen),
+                "rssi": st.rssi,
+                "attempts": st.attempts,
+                "connects": st.connects,
+                "drops": st.drops,
+                "missing_events": st.missing_events,
+                "failures": dict(st.failures),
+                "consecutive_failures": st.consecutive_failures,
+                "next_attempt_in_s": (
+                    max(0.0, round(st.next_attempt_at - now, 1)) if st.client is None else None
+                ),
+                "flakiness": round(self._current_flakiness(st, now), 2),
+                "last_error": st.last_error,
+                "last_attempt": st.last_attempt,
+            }
+        any_connected = any(
+            self.devices[mac].client is not None for mac in self.desired_connections
+        )
+        return {
+            "devices": devices,
+            "adapter_resets": {
+                "count": self.reset_count,
+                "last_reason": self.last_reset_reason,
+                "last_s_ago": ago(self._last_reset_at),
+                "since_last_connect": self._resets_since_success,
+            },
+            "stall": {
+                "no_connection_for_s": 0.0 if any_connected else ago(self._last_healthy),
+                "failed_connects": self._stall_failures,
+            },
         }

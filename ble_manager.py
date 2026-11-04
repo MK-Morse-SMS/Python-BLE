@@ -1,13 +1,20 @@
+import asyncio
+import contextlib
 import logging
-from typing import List, Dict, Any, Mapping
+from typing import List, Dict, Any, Mapping, Optional
+
+from bleak.backends.device import BLEDevice
 
 from event_broadcaster import EventBroadcaster
 
-from dbus_utils import disconnect_all_devices
+from dbus_utils import adapter_state, disconnect_all_devices
 from ble_scanner import BLEScanner
 from ble_connections import BLEConnectionsManager
 
 logger = logging.getLogger(__name__)
+
+STARTUP_DISCONNECT_TIMEOUT_SECONDS = 20
+HEALTH_ADAPTER_TIMEOUT_SECONDS = 5
 
 
 class BLEManager:
@@ -18,42 +25,55 @@ class BLEManager:
 
     def __init__(self):
         """
-        Initialize the BLEManager. For best usage, call `await initialize()`
-        to perform an initial disconnect_all_devices at the system level.
+        Initialize the BLEManager. Call `await initialize()` once the event
+        loop is running to clear stale connections and start the supervisor.
         """
         # An event broadcaster (e.g., for SSE) used by both scanner & connections
         self.event_broadcaster = EventBroadcaster()
 
-        # Create sub-managers
-        self.scanner = BLEScanner(event_broadcaster=self.event_broadcaster)
-        self.connections = BLEConnectionsManager(
-            event_broadcaster=self.event_broadcaster
-        )
+        # Serializes connect attempts, recovery steps and scan-session restarts.
+        self.radio_lock = asyncio.Lock()
 
-        # Set up the device found callback to automatically check for connection
+        # Create sub-managers
+        self.scanner = BLEScanner(
+            event_broadcaster=self.event_broadcaster, radio_lock=self.radio_lock
+        )
+        self.connections = BLEConnectionsManager(
+            event_broadcaster=self.event_broadcaster, radio_lock=self.radio_lock
+        )
+        self.connections.request_scan_restart = self.scanner.request_restart
+        self.connections.scan_session_age = self.scanner.session_age
+        self.connections.scan_ready_for_connects = self.scanner.ready_for_connects
+
         self.scanner.set_device_found_callback(self.handle_device_found)
 
-    def handle_device_found(self, device):
+    def handle_device_found(self, device: BLEDevice, rssi: Optional[int]) -> None:
         """
-        Callback function for when a device is found during scanning.
-        Automatically checks if the device should be connected.
+        Callback for every matching advertisement seen while scanning.
 
         :param device: The discovered BLEDevice.
+        :param rssi: The advertisement's RSSI.
         """
-        mac = device.address
-        if (
-            mac in self.connections.desired_connections
-            and mac not in self.connections.connected_devices
-        ):
-            logger.debug(f"Found desired device {mac}, connecting...")
-            self.connections.add_device(device)
+        self.connections.on_advertisement(device, rssi)
 
     async def initialize(self) -> None:
         """
-        Perform any async initialization. For example, forcibly disconnect
-        all devices at the D-Bus level to ensure a clean environment.
+        Forcibly disconnect all devices at the D-Bus level for a clean
+        environment, then start the connection supervisor.
         """
-        await disconnect_all_devices()
+        try:
+            await asyncio.wait_for(
+                disconnect_all_devices(), STARTUP_DISCONNECT_TIMEOUT_SECONDS
+            )
+        except Exception as e:
+            logger.warning(f"Could not clear stale BlueZ connections at startup: {e}")
+        self.connections.start()
+
+    async def shutdown(self) -> None:
+        """Stop reconnecting, disconnect everything and stop scanning."""
+        await self.connections.stop()
+        await self.connections.disconnect_all()
+        await self.scanner.stop_scan()
 
     async def start_scan(self, service_uuids: List[str]) -> Mapping[str, Any]:
         """
@@ -74,19 +94,17 @@ class BLEManager:
 
     async def add_device(self, mac: str) -> None:
         """
-        Add a device to the desired connections, triggering an immediate connection
-        if the device is currently known.
+        Add a device to the desired connections. The supervisor connects to it
+        as soon as BlueZ knows it.
 
         :param mac: The MAC address of the BLE device to connect to.
         """
-        # First add to desired connections set
-        self.connections.desired_connections.add(mac)
+        mac = mac.upper()
+        self.connections.desire(mac)
 
-        # Retrieve device from scanner cache if present
         device = await self.scanner.get_device(mac)
         if device:
-            # Hand off to the connections manager
-            self.connections.add_device(device)
+            self.connections.on_advertisement(device, None)
         else:
             logger.info(
                 f"Device {mac} added to desired connections, will connect when discovered."
@@ -112,7 +130,7 @@ class BLEManager:
 
         :param mac: Device MAC address.
         :return: A list of characteristic dict objects (UUID, properties, etc.).
-        :raises HTTPException: If device is not connected
+        :raises HTTPException: If device not connected
         """
         return await self.connections.list_characteristics(mac)
 
@@ -182,3 +200,20 @@ class BLEManager:
         :return: A dictionary of connected devices.
         """
         return await self.connections.get_connected_devices()
+
+    async def health(self) -> Dict[str, Any]:
+        """
+        Adapter, scanner, SSE and per-sensor state in one document.
+        """
+        state = None
+        with contextlib.suppress(Exception):
+            state = await asyncio.wait_for(adapter_state(), HEALTH_ADAPTER_TIMEOUT_SECONDS)
+        return {
+            "adapter": None if state is None else {"powered": state[0], "discovering": state[1]},
+            "scanner": self.scanner.health(),
+            "sse": {
+                "clients": self.event_broadcaster.client_count,
+                "dropped_events": self.event_broadcaster.dropped_events,
+            },
+            **self.connections.health(),
+        }

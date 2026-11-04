@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
     # Initialize BLE manager during startup
     await ble_manager.initialize()
     yield
-    await ble_manager.disconnect_all()
+    await ble_manager.shutdown()
 
 
 # Create the FastAPI application

@@ -5,11 +5,12 @@ A Python-based Bluetooth Low Energy (BLE) management service that exposes a REST
 ## Features
 
 - **BLE Scanning** — Scan for nearby BLE devices with optional service UUID filtering
-- **Connection Management** — Batch-connect to devices by MAC address with automatic reconnection on drop
+- **Connection Management** — Batch-connect to devices by MAC address; dropped sensors are reconnected with backoff, and a wedged BlueZ stack is recovered (see [Connection recovery](#connection-recovery))
 - **GATT Operations** — Read and write GATT characteristics by UUID
 - **Notifications** — Enable or disable BLE characteristic notifications
 - **MTU Negotiation** — Query the negotiated MTU size for any connected device
 - **Server-Sent Events (SSE)** — Real-time streaming of scan results, connection events, and notifications to HTTP clients
+- **Health** — `/health` reports adapter, scanner and per-sensor connection state
 - **Docker Support** — Containerised deployment with host BlueZ D-Bus socket pass-through
 
 ## Architecture
@@ -20,7 +21,7 @@ main.py               FastAPI application entry point & lifespan management
 ├── ble_scanner.py    BLE scanning loop (Bleak BleakScanner)
 ├── ble_connections.py  GATT connection management (Bleak BleakClient)
 ├── event_broadcaster.py  Async per-client queue for SSE fanout
-├── dbus_utils.py     D-Bus/BlueZ utility: disconnect all devices at startup
+├── dbus_utils.py     BlueZ helpers: startup disconnect, RemoveDevice, adapter power, state lookups
 ├── routes.py         FastAPI router defining all HTTP endpoints
 └── models.py         Pydantic request models
 ```
@@ -128,6 +129,12 @@ All endpoints are served under the base URL of the running service (e.g. `http:/
 | `DELETE` | `/gatt/nodes/{mac}/characteristic/{char_uuid}` | Disable notifications for a characteristic |
 | `DELETE` | `/gatt/nodes/notifications` | Disable all notifications on all connected devices |
 
+### Health
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Adapter power/discovery, scanner session, SSE backlog, adapter resets, and per-sensor counters (attempts, failures by kind, drops, last seen, RSSI, next attempt) |
+
 ### Events (SSE)
 
 | Method | Path | Description |
@@ -146,6 +153,25 @@ All endpoints are served under the base URL of the running service (e.g. `http:/
 // Characteristic notification
 { "type": "notification", "bdaddr": "DE:6D:5D:2A:BD:58", "characteristic": "<uuid>", "data": "0a1b2c" }
 ```
+
+## Connection recovery
+
+One supervisor task in `ble_connections.py` makes every connect attempt and every recovery step, one at a time. It shares a lock with the scanner's session restarts, so a connect never runs while discovery is off. (Kernel 6.x BlueZ can't connect without an active scan.)
+
+- **Sensor not in BlueZ** (`device '...' not found`): not a failure. The supervisor waits for the sensor to advertise again. If it stays missing, the scan session is restarted at 60 s, 120 s and 240 s.
+- **Failed connects** (timeouts, errors, connections that drop within 15 s): exponential backoff per sensor. Every 3rd failure in a row removes the sensor from BlueZ and restarts the scan; every 6th backs it off for 5 minutes.
+- **Adapter power-cycle**: only when no sensor has connected for 10 minutes despite at least 6 failed connects, and at most every 15 minutes. One failing sensor never resets the adapter while another is connected. After 2 resets with no connection in between, the process exits so the container restarts.
+- **Scanner**: restarts discovery after every adapter reset, every 5 minutes, and whenever a watchdog sees BlueZ stop discovering. It powers the adapter back on if something left it off.
+
+The thresholds are module constants at the top of `ble_connections.py` and `ble_scanner.py`.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests
+```
+
+The tests replace BlueZ and bleak with fakes (`tests/fakes.py`), so they need no Bluetooth hardware.
 
 ## API Collection (Bruno)
 
@@ -167,6 +193,7 @@ Python-BLE/
 ├── main.py                 FastAPI app entry point
 ├── models.py               Pydantic request models
 ├── routes.py               HTTP route definitions
+├── tests/                  Unit tests (fakes for BlueZ and bleak)
 ├── requirements.txt        Python dependencies
 └── Dockerfile              Container build definition
 ```

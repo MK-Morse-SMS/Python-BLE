@@ -60,3 +60,6 @@ docker-compose*.yml
 # Local development settings
 *.log
 *.sqlite3
+
+# Unit tests
+tests/
