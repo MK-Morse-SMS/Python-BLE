@@ -143,6 +143,8 @@ class FakeScanner:
     async def start(self):
         self.factory.starts += 1
         self.factory.sequence.append("start")
+        if self.factory.start_error is not None:
+            raise self.factory.start_error
 
     async def stop(self):
         self.factory.stops += 1
@@ -156,6 +158,7 @@ class FakeScannerFactory:
         self.starts = 0
         self.stops = 0
         self.stop_error = None
+        self.start_error = None
         self.sequence = []
 
     def __call__(self, **kwargs):

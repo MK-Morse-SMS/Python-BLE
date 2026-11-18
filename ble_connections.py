@@ -55,6 +55,14 @@ ADAPTER_STALL_MIN_FAILURES = 6
 ADAPTER_RESET_MIN_INTERVAL_SECONDS = 900
 EXIT_AFTER_FAILED_RESETS = 2
 
+# A scan that won't start blocks every connect, so the rule above never trips.
+# After a controller crash the kernel refuses discovery (BlueZ reports it as
+# org.bluez.Error.InProgress) until hci0 is powered off; a container restart
+# doesn't clear it. So once starts have failed for SCAN_STALL_SECONDS, the
+# adapter is power-cycled whenever a wanted sensor is disconnected, even if
+# others are still connected, and this path never exits.
+SCAN_STALL_SECONDS = 120
+
 # A wanted sensor missing from BlueZ this long gets a fresh scan session, which
 # is what gets it rediscovered. The interval doubles while nothing turns up;
 # past the cap the scanner's regular cycle takes over.
@@ -182,6 +190,7 @@ class BLEConnectionsManager:
         self.request_scan_restart: Callable[[str], None] = lambda reason: None
         self.scan_session_age: Callable[[], Optional[float]] = lambda: None
         self.scan_ready_for_connects: Callable[[], bool] = lambda: True
+        self.scan_failing_for: Callable[[], Optional[float]] = lambda: None
 
         self._wake = asyncio.Event()
         self._supervisor: Optional[asyncio.Task] = None
@@ -490,6 +499,13 @@ class BLEConnectionsManager:
         if self._adapter_stalled(now):
             await self._recover_adapter(now)
             return
+        scan_failing = self._scan_stalled(wanted, now)
+        if scan_failing is not None:
+            async with self.radio_lock:
+                await self._reset_adapter(
+                    f"scan has failed to start for {_fmt_duration(scan_failing)}"
+                )
+            return
 
         await self._refresh_missing(wanted)
         self._maybe_restart_scan_for_missing(wanted, time.monotonic())
@@ -733,6 +749,20 @@ class BLEConnectionsManager:
             self._last_reset_at is None
             or now - self._last_reset_at >= ADAPTER_RESET_MIN_INTERVAL_SECONDS
         )
+
+    def _scan_stalled(self, wanted: List[DeviceState], now: float) -> Optional[float]:
+        """How long the scan has failed to start, if that warrants a reset."""
+        failing = self.scan_failing_for()
+        if failing is None or failing < SCAN_STALL_SECONDS:
+            return None
+        if wanted and all(st.client is not None for st in wanted):
+            return None
+        if (
+            self._last_reset_at is not None
+            and now - self._last_reset_at < ADAPTER_RESET_MIN_INTERVAL_SECONDS
+        ):
+            return None
+        return failing
 
     async def _recover_adapter(self, now: float) -> None:
         reason = (

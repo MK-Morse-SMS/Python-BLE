@@ -22,6 +22,7 @@ FAST = dict(
     ADAPTER_RESET_MIN_INTERVAL_SECONDS=0.5,
     REDISCOVERY_RESTART_SECONDS=0.1,
     REDISCOVERY_RESTART_MAX_SECONDS=0.4,
+    SCAN_STALL_SECONDS=0.2,
 )
 
 
@@ -238,6 +239,46 @@ class TestAdapterRecovery(ConnectionsTestCase):
         self.clients.default = "ok"
         await wait_until(lambda: self.connected(A))
         self.assertEqual(self.mgr._resets_since_success, 0)
+
+
+class TestScanStall(ConnectionsTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.scan_failing = None
+        self.mgr.scan_ready_for_connects = lambda: self.scan_failing is None
+        self.mgr.scan_failing_for = lambda: self.scan_failing
+
+    async def test_resets_adapter_spaced_out_and_never_exits(self):
+        self.mgr.desire(A)
+        self.scan_failing = 1.0
+        with mock.patch.object(os, "_exit") as exit_:
+            await wait_until(lambda: self.bluez.resets == 1)
+            await asyncio.sleep(0.3)
+            self.assertEqual(self.bluez.resets, 1)
+            await wait_until(lambda: self.bluez.resets == 3, timeout=3.0)
+        exit_.assert_not_called()
+        self.assertIn("adapter reset", self.restarts)
+        self.assertEqual(self.clients.connects, [])
+
+    async def test_waits_for_the_stall_threshold(self):
+        self.mgr.desire(A)
+        self.scan_failing = 0.1
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.bluez.resets, 0)
+
+    async def test_resets_only_once_a_wanted_sensor_is_down(self):
+        self.bluez.present.update({A, B})
+        self.mgr.desire(A)
+        self.mgr.desire(B)
+        await wait_until(lambda: self.connected(A) and self.connected(B))
+
+        self.scan_failing = 1.0
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.bluez.resets, 0)
+
+        self.clients.last_client(B).drop()
+        await wait_until(lambda: self.bluez.resets == 1)
+        self.assertFalse(self.connected(A))
 
 
 if __name__ == "__main__":

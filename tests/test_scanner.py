@@ -12,6 +12,7 @@ from fakes import FakeBlueZ, FakeBroadcaster, FakeScannerFactory, advertisement,
 FAST = dict(
     WATCHDOG_INTERVAL_SECONDS=0.02,
     RESTART_PAUSE_SECONDS=0.01,
+    ERROR_BACKOFF_MAX_SECONDS=0.01,
     SCAN_EVENT_MIN_INTERVAL_SECONDS=0.2,
 )
 
@@ -96,6 +97,21 @@ class TestSessions(ScannerTestCase):
         await self.start()
         self.scanner.request_restart("adapter reset")
         await wait_until(lambda: self.factory.starts == 2)
+
+    async def test_reports_how_long_start_has_failed(self):
+        error = "[org.bluez.Error.InProgress] Operation already in progress"
+        self.factory.start_error = BleakError(error)
+        await self.scanner.start_scan([])
+        await wait_until(lambda: self.factory.starts >= 3)
+        first = self.scanner.failing_for()
+        await asyncio.sleep(0.05)
+        self.assertGreater(self.scanner.failing_for(), first)
+        self.assertEqual(self.scanner.health()["last_error"], error)
+        self.assertFalse(self.scanner.ready_for_connects())
+
+        self.factory.start_error = None
+        await wait_until(self.scanner.ready_for_connects)
+        self.assertIsNone(self.scanner.failing_for())
 
     async def test_no_restart_once_stopped(self):
         await self.start()

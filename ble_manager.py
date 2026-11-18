@@ -44,6 +44,7 @@ class BLEManager:
         self.connections.request_scan_restart = self.scanner.request_restart
         self.connections.scan_session_age = self.scanner.session_age
         self.connections.scan_ready_for_connects = self.scanner.ready_for_connects
+        self.connections.scan_failing_for = self.scanner.failing_for
 
         self.scanner.set_device_found_callback(self.handle_device_found)
 

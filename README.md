@@ -161,6 +161,7 @@ One supervisor task in `ble_connections.py` makes every connect attempt and ever
 - **Sensor not in BlueZ** (`device '...' not found`): not a failure. The supervisor waits for the sensor to advertise again. If it stays missing, the scan session is restarted at 60 s, 120 s and 240 s.
 - **Failed connects** (timeouts, errors, connections that drop within 15 s): exponential backoff per sensor. Every 3rd failure in a row removes the sensor from BlueZ and restarts the scan; every 6th backs it off for 5 minutes.
 - **Adapter power-cycle**: only when no sensor has connected for 10 minutes despite at least 6 failed connects, and at most every 15 minutes. One failing sensor never resets the adapter while another is connected. After 2 resets with no connection in between, the process exits so the container restarts.
+- **Scan that won't start**: blocks every connect, so the rule above never trips. After 2 minutes of failed starts the adapter is power-cycled whenever a wanted sensor is disconnected, even if others are connected, at most every 15 minutes, and the process never exits. This is the state after an Intel controller crash (`Hardware error 0x0c` in dmesg): the kernel refuses discovery, BlueZ reports `org.bluez.Error.InProgress`, and a container restart doesn't clear it.
 - **Scanner**: restarts discovery after every adapter reset, every 5 minutes, and whenever a watchdog sees BlueZ stop discovering. It powers the adapter back on if something left it off.
 
 The thresholds are module constants at the top of `ble_connections.py` and `ble_scanner.py`.

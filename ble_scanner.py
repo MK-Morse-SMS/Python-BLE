@@ -74,6 +74,8 @@ class BLEScanner:
         self._restart_reason: Optional[str] = None
         self.session_started_at: Optional[float] = None
         self.session_starts: Counter = Counter()
+        self._failing_since: Optional[float] = None
+        self.last_error: Optional[str] = None
         self._last_scan_event: Dict[str, float] = {}
 
     async def start_scan(self, service_uuids: List[str]) -> Dict[str, str | List[str]]:
@@ -114,6 +116,7 @@ class BLEScanner:
                     await asyncio.wait_for(task, timeout=5.0)
         self.scan_task = None
         self._watchdog_task = None
+        self._failing_since = None
         await self._stop_active()
 
         return {"status": "scanning stopped"}
@@ -138,6 +141,12 @@ class BLEScanner:
         if self.session_started_at is None:
             return None
         return time.monotonic() - self.session_started_at
+
+    def failing_for(self) -> Optional[float]:
+        """Seconds a wanted scan has been failing to start, or None."""
+        if not self._wanted or self._failing_since is None:
+            return None
+        return time.monotonic() - self._failing_since
 
     def set_device_found_callback(
         self, callback: Callable[[BLEDevice, Optional[int]], None]
@@ -220,6 +229,7 @@ class BLEScanner:
                     self.active_scanner = scanner
                     self.session_started_at = time.monotonic()
                 errors = 0
+                self._failing_since = None
                 self.session_starts[reason] += 1
                 logger.log(
                     logging.DEBUG if reason == "cycle" else logging.INFO,
@@ -237,6 +247,9 @@ class BLEScanner:
             except Exception as e:
                 errors += 1
                 delay = min(ERROR_BACKOFF_MAX_SECONDS, 2**errors)
+                if self._failing_since is None:
+                    self._failing_since = time.monotonic()
+                self.last_error = str(e) or type(e).__name__
                 # BlueZ races (e.g. "No powered Bluetooth adapters") are routine
                 # here; only unexpected errors are worth a stack trace.
                 logger.error(
@@ -307,10 +320,13 @@ class BLEScanner:
     def health(self) -> Dict[str, Any]:
         """Scanner state, for /health."""
         age = self.session_age()
+        failing = self.failing_for()
         return {
             "wanted": self._wanted,
             "running": self.session_started_at is not None,
             "session_age_s": None if age is None else round(age, 1),
+            "failing_for_s": None if failing is None else round(failing, 1),
+            "last_error": self.last_error,
             "session_starts": dict(self.session_starts),
             "filters": self.scan_filters,
         }
