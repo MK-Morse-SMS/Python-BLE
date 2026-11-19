@@ -15,7 +15,6 @@ from event_broadcaster import EventBroadcaster
 
 logger = logging.getLogger(__name__)
 
-SCAN_CYCLE_SECONDS = 300
 WATCHDOG_INTERVAL_SECONDS = 5
 # Each SSE "scan" event costs the backend a write lock, and BlueZ reports a
 # sensor many times a second; one event per device per interval is plenty.
@@ -29,8 +28,8 @@ class BLEScanner:
     """
     Handles BLE scanning logic:
       - Start/stop scanning
-      - Restart the discovery session on request, every scan cycle, and
-        whenever BlueZ discovery stops underneath it
+      - Restart the discovery session on request and whenever BlueZ
+        discovery stops underneath it
       - Maintain a list of discovered devices
       - Broadcast scan events
       - Notify when devices are discovered
@@ -62,9 +61,6 @@ class BLEScanner:
         self.active_scanner: Optional[BleakScanner] = None
         self.scan_task: Optional[asyncio.Task] = None
         self._watchdog_task: Optional[asyncio.Task] = None
-
-        # A discovery session is restarted after this long even if nothing asks.
-        self.scan_cycle: float = SCAN_CYCLE_SECONDS
 
         # Called with (device, rssi) for every matching advertisement.
         self.device_found_callback: Optional[Callable[[BLEDevice, Optional[int]], None]] = None
@@ -201,8 +197,8 @@ class BLEScanner:
 
     async def _scan_loop(self) -> None:
         """
-        Runs one discovery session at a time, restarting it every scan cycle or
-        when request_restart() is called, until cancelled.
+        Runs one discovery session at a time, restarting it when
+        request_restart() is called, until cancelled.
         """
         reason = "scan started"
         errors = 0
@@ -231,16 +227,11 @@ class BLEScanner:
                 errors = 0
                 self._failing_since = None
                 self.session_starts[reason] += 1
-                logger.log(
-                    logging.DEBUG if reason == "cycle" else logging.INFO,
-                    f"Scan session started ({reason})",
-                )
+                logger.info(f"Scan session started ({reason})")
 
-                try:
-                    await asyncio.wait_for(self._restart_event.wait(), self.scan_cycle)
-                    reason = self._restart_reason or "restart requested"
-                except asyncio.TimeoutError:
-                    reason = "cycle"
+                # No periodic restart: each stop/start risks wedging BlueZ 5.72 discovery.
+                await self._restart_event.wait()
+                reason = self._restart_reason or "restart requested"
             except asyncio.CancelledError:
                 await self._stop_active()
                 raise

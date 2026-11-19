@@ -29,6 +29,9 @@ class FakeBlueZ:
         self.discovering = True
         self.power_calls = []
         self.forget_on_remove = forget_on_remove
+        self.service_uptime = None
+        self.service_restarts = 0
+        self.service_restart_error = None
 
     async def bluez_device(self, mac):
         if mac in self.present:
@@ -44,6 +47,15 @@ class FakeBlueZ:
     async def reset_adapter(self):
         self.resets += 1
         return True
+
+    async def bluetooth_service_uptime(self):
+        return self.service_uptime
+
+    async def restart_bluetooth_service(self):
+        if self.service_restart_error is not None:
+            raise self.service_restart_error
+        self.service_restarts += 1
+        self.service_uptime = 0.0
 
     async def adapter_state(self):
         return self.powered, self.discovering

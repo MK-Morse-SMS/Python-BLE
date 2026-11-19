@@ -56,18 +56,24 @@ ADAPTER_RESET_MIN_INTERVAL_SECONDS = 900
 EXIT_AFTER_FAILED_RESETS = 2
 
 # A scan that won't start blocks every connect, so the rule above never trips.
-# After a controller crash the kernel refuses discovery (BlueZ reports it as
-# org.bluez.Error.InProgress) until hci0 is powered off; a container restart
-# doesn't clear it. So once starts have failed for SCAN_STALL_SECONDS, the
-# adapter is power-cycled whenever a wanted sensor is disconnected, even if
-# others are still connected, and this path never exits.
+# Seen with BlueZ 5.72: after a routine stop/start of discovery, every start
+# failed with org.bluez.Error.InProgress. A container restart didn't clear it
+# and a power-cycle held for 3 minutes; a reboot did, and restarting bluetoothd
+# is the suspected part (BlueZ #2547, fixed in 5.88). So once starts have failed
+# for SCAN_STALL_SECONDS and a wanted sensor is disconnected, even if others are
+# still connected, the host's Bluetooth service is restarted and the process
+# exits, so the restarted container loads the new bluetoothd's objects. Within
+# BLUETOOTH_RESTART_MIN_UPTIME_SECONDS of bluetoothd starting, or if it can't be
+# restarted, the adapter is power-cycled instead, at most every
+# ADAPTER_RESET_MIN_INTERVAL_SECONDS.
 SCAN_STALL_SECONDS = 120
+BLUETOOTH_RESTART_MIN_UPTIME_SECONDS = 900
 
 # A wanted sensor missing from BlueZ this long gets a fresh scan session, which
-# is what gets it rediscovered. The interval doubles while nothing turns up;
-# past the cap the scanner's regular cycle takes over.
+# is what gets it rediscovered. The interval doubles while nothing turns up,
+# up to the cap.
 REDISCOVERY_RESTART_SECONDS = 60
-REDISCOVERY_RESTART_MAX_SECONDS = 240
+REDISCOVERY_RESTART_MAX_SECONDS = 1800
 
 # Every GATT operation is a D-Bus round-trip to BlueZ, and BlueZ does not always
 # reply. If the device disconnects mid-call — or the device object is removed
@@ -501,10 +507,7 @@ class BLEConnectionsManager:
             return
         scan_failing = self._scan_stalled(wanted, now)
         if scan_failing is not None:
-            async with self.radio_lock:
-                await self._reset_adapter(
-                    f"scan has failed to start for {_fmt_duration(scan_failing)}"
-                )
+            await self._recover_scan(scan_failing)
             return
 
         await self._refresh_missing(wanted)
@@ -687,7 +690,7 @@ class BLEConnectionsManager:
             and st.missing_since is not None
             and now - st.missing_since >= REDISCOVERY_RESTART_SECONDS
         ]
-        if not overdue or self._rediscovery_interval > REDISCOVERY_RESTART_MAX_SECONDS:
+        if not overdue:
             return
         session_age = self.scan_session_age()
         if session_age is None or session_age < self._rediscovery_interval:
@@ -702,7 +705,9 @@ class BLEConnectionsManager:
             f"{_fmt_duration(session_age)} scan session; restarting the scan"
         )
         self._last_rediscovery_restart = now
-        self._rediscovery_interval *= 2
+        self._rediscovery_interval = min(
+            self._rediscovery_interval * 2, REDISCOVERY_RESTART_MAX_SECONDS
+        )
         self.request_scan_restart("rediscover missing sensors")
 
     async def _remove_from_bluez(self, st: DeviceState) -> None:
@@ -777,6 +782,36 @@ class BLEConnectionsManager:
             os._exit(1)
         async with self.radio_lock:
             await self._reset_adapter(reason)
+
+    async def _recover_scan(self, failing: float) -> None:
+        reason = f"scan has failed to start for {_fmt_duration(failing)}"
+        if await self._restart_bluetooth_service(reason):
+            logger.error("Exiting for container restart against the new bluetoothd")
+            os._exit(1)
+        else:
+            async with self.radio_lock:
+                await self._reset_adapter(reason)
+
+    async def _restart_bluetooth_service(self, reason: str) -> bool:
+        """Restart bluetoothd unless it started recently; True once it's queued."""
+        try:
+            uptime = await asyncio.wait_for(
+                self._bluez.bluetooth_service_uptime(), DBUS_OP_TIMEOUT_SECONDS
+            )
+            if uptime is None or uptime < BLUETOOTH_RESTART_MIN_UPTIME_SECONDS:
+                logger.warning(
+                    "Not restarting the Bluetooth service, up for "
+                    f"{'an unknown time' if uptime is None else _fmt_duration(uptime)}"
+                )
+                return False
+            logger.error(f"Restarting the Bluetooth service: {reason}")
+            await asyncio.wait_for(
+                self._bluez.restart_bluetooth_service(), DBUS_OP_TIMEOUT_SECONDS
+            )
+        except Exception as e:
+            logger.error(f"Bluetooth service restart failed: {e}")
+            return False
+        return True
 
     async def _reset_adapter(self, reason: str) -> None:
         self.reset_count += 1

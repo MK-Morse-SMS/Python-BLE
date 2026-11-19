@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from bleak.backends.bluezdbus.manager import get_global_bluez_manager
 from bleak.backends.device import BLEDevice
+from dbus_fast import DBusError, Message, MessageType
 from dbus_fast.aio import MessageBus
 from dbus_fast.constants import BusType
 
@@ -15,6 +17,11 @@ OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
 DEVICE_INTERFACE = "org.bluez.Device1"
 ADAPTER_INTERFACE = "org.bluez.Adapter1"
 DEFAULT_ADAPTER_PATH = "/org/bluez/hci0"
+
+SYSTEMD_SERVICE = "org.freedesktop.systemd1"
+SYSTEMD_PATH = "/org/freedesktop/systemd1"
+SYSTEMD_MANAGER_INTERFACE = "org.freedesktop.systemd1.Manager"
+BLUETOOTH_UNIT = "bluetooth.service"
 
 
 async def disconnect_all_devices() -> None:
@@ -176,6 +183,67 @@ async def reset_adapter(power_off_delay: float = 2.0, power_on_attempts: int = 3
     finally:
         bus.disconnect()
 
+
+
+async def _call_systemd(
+    bus: MessageBus, path: str, interface: str, member: str, signature: str, body: list
+) -> list:
+    reply = await bus.call(
+        Message(
+            destination=SYSTEMD_SERVICE,
+            path=path,
+            interface=interface,
+            member=member,
+            signature=signature,
+            body=body,
+        )
+    )
+    if reply.message_type == MessageType.ERROR:
+        raise DBusError(reply.error_name, reply.body[0] if reply.body else "")
+    return reply.body
+
+
+async def bluetooth_service_uptime() -> Optional[float]:
+    """Seconds since the host's systemd last started bluetoothd, or None if unknown."""
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        (unit_path,) = await _call_systemd(
+            bus, SYSTEMD_PATH, SYSTEMD_MANAGER_INTERFACE, "GetUnit", "s", [BLUETOOTH_UNIT]
+        )
+        (started,) = await _call_systemd(
+            bus,
+            unit_path,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            "ss",
+            ["org.freedesktop.systemd1.Unit", "ActiveEnterTimestampMonotonic"],
+        )
+    finally:
+        bus.disconnect()
+    if not started.value:
+        return None
+    # Containers share the host kernel's CLOCK_MONOTONIC, which systemd uses.
+    return time.monotonic() - started.value / 1e6
+
+
+async def restart_bluetooth_service() -> None:
+    """
+    Ask the host's systemd to restart bluetoothd. Returns once the job is
+    queued. bluetoothd powers the adapter off as it stops, so every connection
+    and BlueZ object goes with it.
+    """
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        await _call_systemd(
+            bus,
+            SYSTEMD_PATH,
+            SYSTEMD_MANAGER_INTERFACE,
+            "RestartUnit",
+            "ss",
+            [BLUETOOTH_UNIT, "replace"],
+        )
+    finally:
+        bus.disconnect()
 
 # The helpers below read bleak's in-process mirror of BlueZ's object tree
 # (BlueZManager._properties / _adapters). bleak keeps it current from D-Bus

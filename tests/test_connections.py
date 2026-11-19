@@ -23,6 +23,7 @@ FAST = dict(
     REDISCOVERY_RESTART_SECONDS=0.1,
     REDISCOVERY_RESTART_MAX_SECONDS=0.4,
     SCAN_STALL_SECONDS=0.2,
+    BLUETOOTH_RESTART_MIN_UPTIME_SECONDS=0.5,
 )
 
 
@@ -161,10 +162,16 @@ class TestPerSensorRecovery(ConnectionsTestCase):
         await wait_until(lambda: self.connected(A))
         self.assertEqual(self.clients.outcomes(A), ["timeout"] * 3 + ["ok"])
 
-    async def test_rediscovery_restarts_back_off(self):
+    async def test_rediscovery_restarts_back_off_to_the_cap(self):
+        times = []
+        self.mgr.request_scan_restart = lambda reason: times.append(time.monotonic())
         self.mgr.desire(A)
-        await asyncio.sleep(1.5)
-        self.assertEqual(self.restarts, ["rediscover missing sensors"] * 3)
+        await wait_until(lambda: len(times) >= 4, timeout=3.0)
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        self.assertGreaterEqual(gaps[0], 0.2)
+        self.assertGreaterEqual(gaps[1], 0.4)
+        self.assertGreaterEqual(gaps[2], 0.4)
+        self.assertLess(gaps[2], 0.6)
 
     async def test_rediscovery_waits_for_a_long_enough_session(self):
         self.mgr.scan_session_age = lambda: 0.05
@@ -248,7 +255,29 @@ class TestScanStall(ConnectionsTestCase):
         self.mgr.scan_ready_for_connects = lambda: self.scan_failing is None
         self.mgr.scan_failing_for = lambda: self.scan_failing
 
+    async def test_restarts_bluetooth_service_then_exits(self):
+        exits = []
+        self.bluez.service_uptime = 3600.0
+        self.mgr.desire(A)
+        self.scan_failing = 1.0
+        with mock.patch.object(os, "_exit", side_effect=lambda code: exits.append(code)):
+            await wait_until(lambda: exits)
+        self.assertEqual(exits, [1])
+        self.assertEqual(self.bluez.service_restarts, 1)
+        self.assertEqual(self.bluez.resets, 0)
+
+    async def test_power_cycles_if_bluetooth_service_cant_restart(self):
+        self.bluez.service_uptime = 3600.0
+        self.bluez.service_restart_error = PermissionError("Access denied")
+        self.mgr.desire(A)
+        self.scan_failing = 1.0
+        with mock.patch.object(os, "_exit") as exit_:
+            await wait_until(lambda: self.bluez.resets == 1)
+        exit_.assert_not_called()
+
     async def test_resets_adapter_spaced_out_and_never_exits(self):
+        # bluetoothd started recently, so the adapter is power-cycled instead.
+        self.bluez.service_uptime = 0.1
         self.mgr.desire(A)
         self.scan_failing = 1.0
         with mock.patch.object(os, "_exit") as exit_:
@@ -257,6 +286,7 @@ class TestScanStall(ConnectionsTestCase):
             self.assertEqual(self.bluez.resets, 1)
             await wait_until(lambda: self.bluez.resets == 3, timeout=3.0)
         exit_.assert_not_called()
+        self.assertEqual(self.bluez.service_restarts, 0)
         self.assertIn("adapter reset", self.restarts)
         self.assertEqual(self.clients.connects, [])
 

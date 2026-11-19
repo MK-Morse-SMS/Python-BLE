@@ -86,11 +86,10 @@ class TestSessions(ScannerTestCase):
             self.assertFalse(self.scanner.ready_for_connects())
         await wait_until(self.scanner.ready_for_connects)
 
-    async def test_cycle_restarts_without_a_request(self):
-        self.scanner.scan_cycle = 0.05
+    async def test_no_restart_without_a_request(self):
         await self.start()
-        await wait_until(lambda: self.factory.starts >= 3)
-        self.assertGreaterEqual(self.scanner.session_starts["cycle"], 2)
+        await asyncio.sleep(0.1)
+        self.assertEqual((self.factory.starts, self.factory.stops), (1, 0))
 
     async def test_stop_error_after_reset_is_tolerated(self):
         self.factory.stop_error = BleakError("[org.bluez.Error.Failed] No discovery started")
