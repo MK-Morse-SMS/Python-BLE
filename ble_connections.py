@@ -60,8 +60,8 @@ EXIT_AFTER_FAILED_RESETS = 2
 # failed with org.bluez.Error.InProgress. A container restart didn't clear it
 # and a power-cycle held for 3 minutes; a reboot did, and restarting bluetoothd
 # is the suspected part (BlueZ #2547, fixed in 5.88). So once starts have failed
-# for SCAN_STALL_SECONDS and a wanted sensor is disconnected, even if others are
-# still connected, the host's Bluetooth service is restarted and the process
+# for SCAN_STALL_SECONDS, unless sensors are wanted and all of them are still
+# connected, the host's Bluetooth service is restarted and the process
 # exits, so the restarted container loads the new bluetoothd's objects. Within
 # BLUETOOTH_RESTART_MIN_UPTIME_SECONDS of bluetoothd starting, or if it can't be
 # restarted, the adapter is power-cycled instead, at most every
