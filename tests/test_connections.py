@@ -266,6 +266,18 @@ class TestScanStall(ConnectionsTestCase):
         self.assertEqual(self.bluez.service_restarts, 1)
         self.assertEqual(self.bluez.resets, 0)
 
+    async def test_skips_recovery_if_the_scan_starts_meanwhile(self):
+        self.bluez.service_uptime = 3600.0
+        self.mgr.desire(A)
+        with mock.patch.object(os, "_exit") as exit_:
+            async with self.mgr.radio_lock:
+                self.scan_failing = 1.0
+                await asyncio.sleep(0.1)
+                self.scan_failing = None
+            await asyncio.sleep(0.1)
+        exit_.assert_not_called()
+        self.assertEqual((self.bluez.service_restarts, self.bluez.resets), (0, 0))
+
     async def test_power_cycles_if_bluetooth_service_cant_restart(self):
         self.bluez.service_uptime = 3600.0
         self.bluez.service_restart_error = PermissionError("Access denied")

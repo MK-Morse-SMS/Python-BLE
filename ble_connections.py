@@ -505,9 +505,8 @@ class BLEConnectionsManager:
         if self._adapter_stalled(now):
             await self._recover_adapter(now)
             return
-        scan_failing = self._scan_stalled(wanted, now)
-        if scan_failing is not None:
-            await self._recover_scan(scan_failing)
+        if self._scan_stalled(wanted, now) is not None:
+            await self._recover_scan()
             return
 
         await self._refresh_missing(wanted)
@@ -783,13 +782,18 @@ class BLEConnectionsManager:
         async with self.radio_lock:
             await self._reset_adapter(reason)
 
-    async def _recover_scan(self, failing: float) -> None:
-        reason = f"scan has failed to start for {_fmt_duration(failing)}"
-        if await self._restart_bluetooth_service(reason):
-            logger.error("Exiting for container restart against the new bluetoothd")
-            os._exit(1)
-        else:
-            async with self.radio_lock:
+    async def _recover_scan(self) -> None:
+        # Holding the lock keeps the scanner from starting a session, but it may
+        # have started one while this waited for the lock.
+        async with self.radio_lock:
+            failing = self.scan_failing_for()
+            if failing is None:
+                return
+            reason = f"scan has failed to start for {_fmt_duration(failing)}"
+            if await self._restart_bluetooth_service(reason):
+                logger.error("Exiting for container restart against the new bluetoothd")
+                os._exit(1)
+            else:
                 await self._reset_adapter(reason)
 
     async def _restart_bluetooth_service(self, reason: str) -> bool:
